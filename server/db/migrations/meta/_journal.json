@@ -8,6 +8,41 @@
       "when": 1791021157783,
       "tag": "0000_init",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1791024641105,
+      "tag": "0001_checkpoints",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1791025033058,
+      "tag": "0002_quota_details",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1791025628000,
+      "tag": "0003_run_log",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1791027167691,
+      "tag": "0004_playlist_backups",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1791028415790,
+      "tag": "0005_unavailable_items",
+      "breakpoints": true
     }
   ]
 }

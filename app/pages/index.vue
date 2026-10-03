@@ -1,9 +1,11 @@
 <script setup lang="ts">
-import type { CollectionDiff, ConnectionView, DiffRow, SyncResult, TrackView } from '~~/shared/types'
+import type { CollectionDiff, ConnectionView, DiffRow, RunStatus, SyncResult, TrackView } from '~~/shared/types'
 
 const { data: connections } = await useFetch<ConnectionView[]>('/api/connections')
-const { data: library, refresh } = await useFetch<{ result: SyncResult | null, lastError: string | null, runs: number[] }>('/api/library')
+const { data: library, refresh } = await useFetch<{ result: SyncResult | null, provisional: boolean, run: RunStatus | null, runs: number[] }>('/api/library')
 const progress = useSyncProgress(() => refresh())
+const run = computed(() => library.value?.run ?? null)
+const resumeAt = computed(() => progress.value?.resumeAt ?? run.value?.pause?.resumeAt ?? null)
 
 const selectedKey = ref<string | null>(null)
 const showAll = ref(false)
@@ -16,18 +18,19 @@ const rows = computed(() => (selected.value?.rows ?? []).filter(r => showAll.val
 const running = computed(() => progress.value?.running ?? false)
 
 const totals = computed(() => {
-  const t = { add: 0, review: 0, unmatched: 0, create: 0 }
+  const t = { add: 0, review: 0, pending: 0, unmatched: 0, create: 0 }
   for (const c of collections.value) {
     t.add += c.counts.add
     t.review += c.counts.review
     t.unmatched += c.counts.unmatched
+    t.pending += c.counts.pending ?? 0
     if (!c.onSpotify || !c.onTidal) t.create++
   }
   return t
 })
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
-const differences = (c: CollectionDiff) => c.counts.add + c.counts.review + c.counts.unmatched
+const differences = (c: CollectionDiff) => c.counts.add + c.counts.review + (c.counts.pending ?? 0) + c.counts.unmatched
 
 async function sync() {
   syncError.value = null
@@ -40,7 +43,8 @@ async function sync() {
 
 const name = { spotify: 'Spotify', tidal: 'Tidal' } as const
 const fmtDuration = (ms: number) => `${Math.floor(ms / 60000)}:${String(Math.round((ms % 60000) / 1000)).padStart(2, '0')}`
-const fmtTime = (iso?: string) => (iso ? new Date(iso).toISOString().slice(11, 16) + ' UTC' : 'never')
+const fmtTime = (iso?: string | null) => (iso ? new Date(iso).toISOString().slice(11, 16) + ' UTC' : 'never')
+const fmtWhen = formatWhen
 const meta = (t: TrackView) => [fmtDuration(t.durationMs), t.isrc].filter(Boolean).join(' · ')
 
 function action(row: DiffRow): { title: string, detail: string, tone: string } {
@@ -48,8 +52,18 @@ function action(row: DiffRow): { title: string, detail: string, tone: string } {
   switch (row.state) {
     case 'add': return { title: `Add → ${to}`, detail: `${row.method === 'isrc' ? 'isrc' : row.method} match ${(row.confidence ?? 1).toFixed(2)}`, tone: '' }
     case 'review': return { title: 'Review match', detail: `candidate · score ${(row.candidate?.score ?? 0).toFixed(2)}`, tone: 'amber' }
-    case 'unmatched': return { title: 'Unmatched', detail: row.reason === 'low_confidence' ? 'candidates found, none good enough' : row.reason === 'ignored' ? 'ignored by you' : `isrc and search empty on ${row.target}`, tone: 'muted' }
+    case 'pending': return { title: 'Not checked yet', detail: `lookup on ${row.target} waits for the next run`, tone: 'muted' }
+    case 'unmatched': return { title: 'Unmatched', detail: unmatchedDetail(row), tone: 'muted' }
     default: return { title: 'In sync', detail: '', tone: 'muted' }
+  }
+}
+
+function unmatchedDetail(row: DiffRow): string {
+  switch (row.reason) {
+    case 'no_isrc_match': return row.spotify?.isrc || row.tidal?.isrc ? `no isrc match on ${row.target}` : 'no isrc to look up'
+    case 'low_confidence': return 'candidates found, none good enough'
+    case 'ignored': return 'ignored by you'
+    default: return `isrc and search empty on ${row.target}`
   }
 }
 
@@ -63,8 +77,16 @@ const gap = (row: DiffRow) => (row.state === 'unmatched' ? `Not found on ${row.t
     <div v-if="!allConnected" class="banner error">
       Connect both services before the first sync. <NuxtLink to="/connections">Go to Connections</NuxtLink>
     </div>
-    <div v-if="syncError || progress?.error || (!running && library?.lastError)" class="banner error" role="alert">
-      Last sync failed: {{ syncError || progress?.error || library?.lastError }}
+    <div v-if="syncError" class="banner error" role="alert">{{ syncError }}</div>
+    <div v-else-if="!running && run?.status === 'failed'" class="banner error" role="alert">
+      The last sync stopped during {{ run.phase ?? 'start-up' }}: {{ progress?.error || run.error }}. Everything it fetched and matched is saved; Sync resumes from there.
+    </div>
+    <div v-else-if="!running && run?.status === 'paused' && run.pause" class="banner pause">
+      <strong>Paused:</strong> {{ run.pause.message }}.
+      <template v-if="run.pause.reason === 'quota'">Spotify doesn't publish its quota, and resets have taken 13 to 18 hours.</template>
+      Progress is saved<template v-if="run.pending"> and {{ plural(run.pending, 'track') }} {{ run.pending === 1 ? 'is' : 'are' }} still to look up</template>.
+      Crossfade continues automatically <template v-if="resumeAt">at {{ fmtWhen(resumeAt) }}</template>; nothing is written.
+      <NuxtLink :to="`/runs/${run.id}`">See where it stopped</NuxtLink>
     </div>
 
     <section class="top">
@@ -76,7 +98,7 @@ const gap = (row: DiffRow) => (row.state === 'unmatched' ? `Not found on ${row.t
           </div>
           <div class="mono hero-meta">
             <div>{{ plural(selected?.counts.total ?? 0, 'track') }}</div>
-            <div>last run {{ fmtTime(library?.result?.finishedAt) }}</div>
+            <div>{{ library?.provisional ? 'unfinished run' : 'last run' }} {{ fmtTime(library?.result?.finishedAt) }}</div>
           </div>
         </div>
         <p v-if="selected && (!selected.onSpotify || !selected.onTidal)" class="hero-note">
@@ -103,11 +125,12 @@ const gap = (row: DiffRow) => (row.state === 'unmatched' ? `Not found on ${row.t
         </div>
         <div class="label queue-sub">
           <template v-if="running">{{ progress?.message }}<span v-if="progress?.total"> · {{ progress.done }}/{{ progress.total }}</span></template>
-          <template v-else>{{ plural(totals.add, 'add') }} · {{ plural(totals.review, 'review') }} · {{ totals.unmatched }} unmatched<span v-if="totals.create"> · {{ plural(totals.create, 'playlist') }} to create</span></template>
+          <template v-else>{{ plural(totals.add, 'add') }} · {{ plural(totals.review, 'review') }}<span v-if="totals.pending"> · {{ totals.pending }} not checked</span> · {{ totals.unmatched }} unmatched<span v-if="totals.create"> · {{ plural(totals.create, 'playlist') }} to create</span></template>
         </div>
         <EqualizerDots class="queue-eq" :values="library?.runs ?? []" :columns="20" :animate="running" />
+        <NuxtLink v-if="run" :to="`/runs/${run.id}`" class="mono view-run">{{ running || run.status !== 'succeeded' ? 'Watch this sync' : 'See how the last sync went' }} →</NuxtLink>
         <div class="queue-actions">
-          <button class="pill outline-dark" type="button" :disabled="running || !allConnected" @click="sync">{{ running ? 'Syncing' : 'Sync' }}</button>
+          <button class="pill outline-dark" type="button" :disabled="running || !allConnected" @click="sync">{{ running ? 'Syncing' : run && run.status !== 'succeeded' ? 'Resume' : 'Sync' }}</button>
           <button class="pill solid-black" type="button" disabled title="Apply arrives in M5. V0 only plans.">Apply {{ totals.add }}</button>
         </div>
       </div>
@@ -136,9 +159,9 @@ const gap = (row: DiffRow) => (row.state === 'unmatched' ? `Not found on ${row.t
 
       <div class="card table">
         <div class="table-head">
-          <span class="label"><span class="dot spotify" /> Spotify</span>
+          <span class="label col-label"><ServiceIcon provider="spotify" :size="14" /> Spotify</span>
           <span />
-          <span class="label"><span class="dot tidal" /> Tidal</span>
+          <span class="label col-label"><ServiceIcon provider="tidal" :size="14" /> Tidal</span>
           <span class="label">Action</span>
           <div class="toggle">
             <button type="button" class="pill small" :class="{ 'solid-mint': !showAll }" @click="showAll = false">Differences</button>
@@ -201,6 +224,7 @@ const gap = (row: DiffRow) => (row.state === 'unmatched' ? `Not found on ${row.t
 .queue-count { font-size: 28px; white-space: nowrap; }
 .queue-sub { min-height: 2.4em; }
 .queue-eq { color: #000; }
+.view-run { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #000; padding: 6px 0; }
 .queue-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: auto; }
 
 .body { display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: 16px; margin-top: 16px; align-items: start; }
@@ -222,6 +246,7 @@ const gap = (row: DiffRow) => (row.state === 'unmatched' ? `Not found on ${row.t
 .table { padding: 12px; overflow: hidden; }
 .table-head, .row { display: grid; grid-template-columns: minmax(0, 1.3fr) 36px minmax(0, 1.3fr) minmax(0, 1.2fr) 120px; gap: 14px; align-items: center; }
 .table-head { padding: 12px 14px; }
+.col-label { display: inline-flex; align-items: center; gap: 8px; }
 .toggle { display: flex; gap: 4px; justify-content: flex-end; }
 .row { padding: 14px; border-radius: var(--radius-row); }
 .row.review { background: rgba(242, 184, 75, 0.08); }

@@ -24,7 +24,7 @@ export interface PlannedRow {
   link?: LinkInfo
 }
 
-const ORDER: Record<RowState, number> = { review: 0, add: 1, unmatched: 2, in_sync: 3 }
+const ORDER: Record<RowState, number> = { review: 0, add: 1, pending: 2, unmatched: 3, in_sync: 4 }
 
 export function diffCollection(input: DiffInput): PlannedRow[] {
   const onSpotify = input.spotify ?? new Set<number>()
@@ -48,6 +48,7 @@ function stateFor(link: LinkInfo | undefined): RowState {
   switch (link?.status) {
     case 'matched': return 'add'
     case 'review': return 'review'
+    case undefined: return 'pending' // not looked up yet (quota, budget, or a run still in progress)
     default: return 'unmatched'
   }
 }

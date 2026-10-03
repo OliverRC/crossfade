@@ -1,4 +1,5 @@
 import type { ProviderId, ProviderPlaylist, ProviderTrack } from '../../shared/types'
+import type { IsrcLookup } from './spotify-isrc'
 
 /**
  * The only code that talks to Spotify or Tidal implements this.
@@ -7,10 +8,14 @@ import type { ProviderId, ProviderPlaylist, ProviderTrack } from '../../shared/t
  */
 export interface MusicProvider {
   readonly id: ProviderId
+  /** ISRCs handed to one findByIsrcs call (Spotify 5, Tidal 20): a quota error loses at most one call's results. */
+  readonly isrcBatchSize: number
   getLikedTracks(): Promise<ProviderTrack[]>
   getOwnedPlaylists(): Promise<ProviderPlaylist[]>
   getPlaylistTracks(playlistId: string): Promise<ProviderTrack[]>
-  /** Batched: Tidal resolves up to 20 ISRCs per call. Each ISRC maps to every track found for it. */
-  findByIsrcs(isrcs: string[]): Promise<Map<string, ProviderTrack[]>>
+  /** Each ISRC maps to every track found for it; `requests` is what the lookup cost. */
+  findByIsrcs(isrcs: string[]): Promise<IsrcLookup>
   search(query: string): Promise<ProviderTrack[]>
+  /** How lookups are being made, when that was learned at runtime (Spotify's OR support). */
+  lookupMode?(): string | null
 }

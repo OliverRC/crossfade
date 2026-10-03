@@ -5,7 +5,8 @@ Self-hosted two-way sync of one person's Spotify and Tidal libraries (liked song
 ## Status
 
 - Current milestone: **V0** (replaces M0, covers M1 and most of M2; see `docs/decisions/0002`). Done when Oliver can log in, connect both services, and see a real dry-run diff of his liked songs and playlists.
-- Next: M3 (manual search and review), then M4 (snapshots and queue), M5 (writes). Docker and Unraid packaging can slot in whenever he wants it deployed.
+- Next: M4 (main and pull), then M5 (push), then M3 (manual search and review); see `docs/decisions/0005`. A one-press sync (pull both, push both) waits until pull and push are trusted. Docker and Unraid packaging can slot in whenever he wants it deployed.
+- Syncs are checkpointed and resumable, and pause on quota (`docs/decisions/0003`). Spotify's Development Mode quota is unpublished, with reported cooldowns of 13 to 18 hours: never retry `QUOTA_EXCEEDED`, and keep Spotify lookups rationed.
 - Work one milestone at a time. Stop at each milestone's "Done when" for Oliver to verify.
 
 ## Commands
@@ -18,7 +19,7 @@ Self-hosted two-way sync of one person's Spotify and Tidal libraries (liked song
 
 ## Principles
 
-- Sync only plans. Every change lands in a persistent queue; Apply is the only code path that writes to Spotify or Tidal.
+- The git model (`docs/decisions/0005`): main is the canonical library; Spotify and Tidal are equal remotes. Pull reads one service and updates main, never writing to a service. Push is the only code path that writes to Spotify or Tidal, and it always shows its changes before writing.
 - ISRC before anything fuzzy. Fuzzy matches are proposed for review, never auto-linked in the MVP.
 - Human decisions (manual links, ignores, dequeues) are stored and never re-litigated.
 - Failures and unmatched tracks are states on the item and clear themselves when resolved.
@@ -35,7 +36,7 @@ Ask before adding dependencies outside this stack.
 - Treat API knowledge from training data as stale. Check Spotify calls against the February and March 2026 changelogs, and Tidal calls against the published OpenAPI spec (`https://tidal-music.github.io/tidal-api-reference/tidal-api-oas.json`).
 - Thin typed clients per provider on `ofetch`; no third-party Spotify SDKs unless confirmed to use `/items` and `/me/library`.
 - Adapters are the only code that talks to Spotify or Tidal. `server/core` (matching, diff, planning) is pure functions over snapshots: no I/O.
-- No writes to the real library before M5, except to a dedicated test playlist on each service.
+- No writes to the real library before M5, except to a dedicated test playlist on each service, and the Tidal playlist cleanup (`docs/decisions/0004`): merging exact duplicate copies and removing empty playlists, confirmed by Oliver on the Cleanup page.
 - Test diff rules table-driven, one case per row of the plan's diff table. Test adapters against recorded HTTP fixtures.
 - Secrets never go in the repo or image; keep `.env.example` current.
 - All timestamps UTC.
@@ -47,6 +48,8 @@ Spotify:
 - Playlist items: `/playlists/{id}/items` (old `/tracks` paths return 403). Item objects use `item` (was `track`). Remove body is `{ items: [{ uri }], snapshot_id? }`.
 - Create playlist: `POST /me/playlists`. Search `limit` max 10.
 - `external_ids` (ISRC) was removed in Feb 2026 and restored in March 2026.
+- No batch ISRC lookup (Get Several Tracks is gone). Search with `OR` between `isrc:` filters is undocumented; `server/providers/spotify-isrc.ts` detects whether it works and falls back to one ISRC per request.
+- Development Mode quota: unpublished, shared across the developer account; `429` with `reason: QUOTA_EXCEEDED`, reported cooldowns of 13 to 18 hours.
 
 Tidal (`https://openapi.tidal.com/v2`, JSON:API, `application/vnd.api+json`):
 - Liked tracks: `/userCollectionTracks/me/relationships/items` (GET, POST, DELETE; max 50 per write).

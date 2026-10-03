@@ -52,17 +52,15 @@ button { font: inherit; color: inherit; }
 .pill:disabled, .pill[aria-disabled='true'] { cursor: not-allowed; opacity: 0.55; }
 .pill.solid-black { background: #000; color: var(--text); border-color: #000; }
 .pill.solid-mint { background: var(--mint); color: var(--on-accent); border-color: var(--mint); }
+.pill.solid-amber { background: var(--amber); color: var(--on-accent); border-color: var(--amber); }
 .pill.solid-coral { background: var(--coral); color: var(--on-accent); border-color: var(--coral); }
 .pill.outline-dark { border-color: rgba(0, 0, 0, 0.75); color: var(--on-accent); }
 .pill.outline-amber { border-color: var(--amber); color: var(--amber); }
 .pill.dashed { border-style: dashed; color: var(--text-faint); border-color: var(--hairline); cursor: default; }
 
-.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
-.dot.spotify { background: var(--spotify); }
-.dot.tidal { background: var(--tidal); }
-
 .banner { border-radius: var(--radius-row); padding: 14px 18px; margin-bottom: 16px; font-size: 14px; }
 .banner.error { background: rgba(255, 68, 56, 0.12); color: #ffb3ad; border: 1px solid rgba(255, 68, 56, 0.4); }
+.banner.pause { background: rgba(242, 184, 75, 0.1); color: #f7d79b; border: 1px solid rgba(242, 184, 75, 0.4); }
 .banner.ok { background: rgba(212, 245, 207, 0.1); color: var(--mint); border: 1px solid rgba(212, 245, 207, 0.35); }
 
 input[type='text'], input[type='password'] {

@@ -11,7 +11,7 @@ describe('bootstrap diff (union merge)', () => {
     { name: 'Tidal only, matched on Spotify → add to Spotify', spotify: [], tidal: [1], link: { status: 'matched', method: 'isrc' }, expected: { state: 'add', target: 'spotify' } },
     { name: 'fuzzy candidate → review', spotify: [1], tidal: [], link: { status: 'review', confidence: 0.82 }, expected: { state: 'review', target: 'tidal' } },
     { name: 'no counterpart → unmatched', spotify: [1], tidal: [], link: { status: 'unmatched', reason: 'not_found' }, expected: { state: 'unmatched', target: 'tidal' } },
-    { name: 'never checked → unmatched', spotify: [1], tidal: [], expected: { state: 'unmatched', target: 'tidal' } },
+    { name: 'not looked up yet → pending', spotify: [1], tidal: [], expected: { state: 'pending', target: 'tidal' } },
     { name: 'ignored → unmatched', spotify: [1], tidal: [], link: { status: 'ignored', reason: 'ignored' }, expected: { state: 'unmatched', target: 'tidal' } },
     { name: 'playlist missing on Tidal, matched → add (playlist created first)', spotify: [1], tidal: null, link: { status: 'matched' }, expected: { state: 'add', target: 'tidal' } },
   ]
@@ -28,12 +28,12 @@ describe('bootstrap diff (union merge)', () => {
     })
   }
 
-  it('never plans a removal and orders review, add, unmatched, in sync', () => {
+  it('never plans a removal and orders review, add, pending, unmatched, in sync', () => {
     const rows = diffCollection({
-      spotify: new Set([1, 2, 3, 4]),
+      spotify: new Set([1, 2, 3, 4, 5]),
       tidal: new Set([1]),
       linkOn: links({ '2:tidal': { status: 'unmatched' }, '3:tidal': { status: 'matched' }, '4:tidal': { status: 'review' } }),
     })
-    expect(rows.map(r => r.state)).toEqual(['review', 'add', 'unmatched', 'in_sync'])
+    expect(rows.map(r => r.state)).toEqual(['review', 'add', 'pending', 'unmatched', 'in_sync'])
   })
 })
