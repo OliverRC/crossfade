@@ -1,0 +1,9 @@
+{
+  "name": "crossfade",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "spike": "node spike/m0.ts"
+  }
+}
