@@ -4,5 +4,4 @@ node_modules/
 .env
 *.db
 *.db-*
-spike/.tokens.json
-spike/out/
+data/

@@ -2,22 +2,21 @@
 
 Two-way sync for a personal Spotify and Tidal library, with a side-by-side diff and an editable queue. Sync only plans; Apply writes. See `docs/plan.md`.
 
-## M0: API spike
+Status: V0. Sign in, connect both services, run a dry-run sync, and see the diff. Nothing is written to either service yet.
 
-1. Create a Spotify app (Development Mode) and a Tidal app. Register these redirect URIs:
-   - `http://127.0.0.1:8888/callback/spotify`
-   - `http://127.0.0.1:8888/callback/tidal`
-2. On each service, create an empty playlist named something like "Crossfade test".
-3. `cp .env.example .env` and fill in `SPOTIFY_CLIENT_ID`, `TIDAL_CLIENT_ID`, and the two test playlist IDs.
-4. Run, for each of `spotify` and `tidal`:
+## Run it
 
-   ```sh
-   node spike/m0.ts auth spotify
-   node spike/m0.ts read spotify
-   node spike/m0.ts write-playlist spotify              # writes only to the test playlist
-   node spike/m0.ts write-liked spotify <trackId>       # a track you have NOT liked; likes then unlikes it
-   ```
+1. Register a Spotify app and a Tidal app with these redirect URIs:
+   - `http://127.0.0.1:4050/auth/spotify/callback`
+   - `http://127.0.0.1:4050/auth/tidal/callback`
+2. Fill in `.env` (see `.env.example`): the client IDs, plus `APP_PASSWORD_HASH` from `pnpm hash-password '<password>'`.
+3. `pnpm install`, then `pnpm dev`, and open http://localhost:4050 (it redirects to `127.0.0.1:4050`, which Spotify requires for sign-in).
+4. Log in, connect both services on Connections, then press Sync on the library page.
 
-Raw responses land in `spike/out/` (gitignored).
+## Develop
 
-M0 is done when every command succeeds on both services and `read tidal` shows that `filter[owners.id]=me` returns only your own playlists.
+```sh
+pnpm test        # unit tests and a dry run against fake providers
+pnpm typecheck
+pnpm db:generate --name <change>   # after editing server/db/schema.ts
+```

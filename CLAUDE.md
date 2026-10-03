@@ -4,8 +4,17 @@ Self-hosted two-way sync of one person's Spotify and Tidal libraries (liked song
 
 ## Status
 
-- Current milestone: **M0 API spike** (`spike/`). No app code until M0's "Done when" is met and Oliver has verified it.
+- Current milestone: **V0** (replaces M0, covers M1 and most of M2; see `docs/decisions/0002`). Done when Oliver can log in, connect both services, and see a real dry-run diff of his liked songs and playlists.
+- Next: M3 (manual search and review), then M4 (snapshots and queue), M5 (writes). Docker and Unraid packaging can slot in whenever he wants it deployed.
 - Work one milestone at a time. Stop at each milestone's "Done when" for Oliver to verify.
+
+## Commands
+
+- `pnpm dev`: dev server on port 4050. Spotify rejects `localhost` redirect URIs, so the app is served from `127.0.0.1:4050`; requests to `localhost:4050` are redirected there (`server/middleware/0.canonical-host.ts`) so the login cookie and OAuth callback share a host.
+- `pnpm test`: Vitest (core, crypto, and an end-to-end dry run against fake providers).
+- `pnpm typecheck`
+- `pnpm db:generate --name <change>` after editing `server/db/schema.ts`. Migrations apply on server start.
+- `pnpm hash-password '<password>'` prints `APP_PASSWORD_HASH`.
 
 ## Principles
 
@@ -46,7 +55,7 @@ Tidal (`https://openapi.tidal.com/v2`, JSON:API, `application/vnd.api+json`):
 - ISRC lookup: `GET /tracks?filter[isrc]=…`. Search: `/searchResults/{query}/relationships/tracks`.
 - OAuth: `https://login.tidal.com/authorize`, token `https://auth.tidal.com/v1/oauth2/token`, PKCE.
 
-## Layout (from M1)
+## Layout
 
 ```
 /app                       Nuxt pages, components, composables
@@ -61,7 +70,7 @@ Tidal (`https://openapi.tidal.com/v2`, JSON:API, `application/vnd.api+json`):
 /tests                     Vitest unit and fixture-based adapter tests
 /deploy                    Dockerfile, Unraid template
 /docs/decisions            decision notes
-/spike                     M0 throwaway API spike
+/scripts                   CLI helpers
 ```
 
 ## Visual design
