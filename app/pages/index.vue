@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { CollectionStatusView, ConnectionView, HoldView, LibraryView, ProviderId, SideState, StatusRowView } from '~~/shared/types'
+import type { CollectionStatusView, ConnectionView, HoldView, LibraryView, ProviderId, SideState, StatusCounts, StatusRowView } from '~~/shared/types'
 
 const selectedKey = ref<string | undefined>(undefined)
 const { data: connections } = await useFetch<ConnectionView[]>('/api/connections')
@@ -67,12 +67,17 @@ const namesakeOn = (c: CollectionStatusView | undefined, p: ProviderId) => c?.na
 /** The followed side of the selected collection, if any: its rows cannot be compared there. */
 const followedOn = computed(() => PROVIDERS.filter(p => selected.value?.shared[p]?.access === 'followed'))
 const owner = (c: CollectionStatusView | undefined, p: ProviderId) => c?.shared[p]?.ownerName ?? 'someone else'
-function serviceLine(c: CollectionStatusView | undefined, p: ProviderId): string {
+/** Where the collection lives on one service, as an icon, a glyph and a few words. */
+function presence(c: CollectionStatusView | undefined, p: ProviderId): { glyph: string, text: string, dim: boolean, label: string } {
   const shared = c?.shared[p]
-  if (shared?.access === 'followed') return `followed on ${names[p]} · ${owner(c, p)}'s`
-  if (shared?.access === 'collaborative') return `on ${names[p]} · with ${owner(c, p)}`
-  return c?.on[p] ? `on ${names[p]}` : `not on ${names[p]}`
+  if (shared?.access === 'followed') return { glyph: '–', text: `${owner(c, p)}'s · followed`, dim: false, label: `Followed on ${names[p]}: ${owner(c, p)}'s playlist, cannot be read` }
+  if (shared?.access === 'collaborative') return { glyph: '✓', text: `with ${owner(c, p)}`, dim: false, label: `On ${names[p]}, collaborative with ${owner(c, p)}` }
+  if (c?.on[p]) return { glyph: '✓', text: names[p], dim: false, label: `On ${names[p]}` }
+  if (!library.value?.services[p].pulledAt) return { glyph: '…', text: names[p], dim: true, label: `${names[p]} not pulled yet` }
+  return { glyph: '✗', text: names[p], dim: true, label: `Not on ${names[p]}` }
 }
+/** Services a push would change for this collection; followed copies are never pushed. */
+const planned = (c: CollectionStatusView | undefined) => c ? PROVIDERS.filter(p => waiting(c.counts)[p] > 0 && c.shared[p]?.access !== 'followed') : []
 const plural = (n: number, word: string) => `${n.toLocaleString('en-GB')} ${word}${n === 1 ? '' : 's'}`
 const fmtDuration = (ms: number) => `${Math.floor(ms / 60000)}:${String(Math.round((ms % 60000) / 1000)).padStart(2, '0')}`
 
@@ -85,10 +90,17 @@ async function act(request: () => Promise<unknown>) {
     actionError.value = e?.data?.statusMessage ?? 'That did not work'
   }
 }
-const post = (url: string, body?: Record<string, string>) => act(() => $fetch<unknown>(url, { method: 'POST', body }))
+const post = (url: string, body?: Record<string, unknown>) => act(() => $fetch<unknown>(url, { method: 'POST', body }))
 const pull = (p: ProviderId) => post(`/api/pull/${p}`)
 const decideConflict = (row: StatusRowView, resolution: 'keep' | 'remove') => post(`/api/conflicts/${row.conflict!.id}`, { resolution })
 const decideHold = (h: HoldView, action: 'accept' | 'keep' | 'remove') => post(`/api/holds/${h.id}`, { action })
+
+/** Staging (docs/decisions/0007): pick which changes the next push to each service carries. New changes start unstaged. */
+const stage = (filter: { collection?: string, track?: number, provider?: ProviderId, change?: 'add' | 'remove' }, staged: boolean) => post('/api/staged', { ...filter, staged })
+const stagedCount = (c: StatusCounts) => ({ spotify: c.staged.add.spotify + c.staged.remove.spotify, tidal: c.staged.add.tidal + c.staged.remove.tidal })
+const stagedIn = (c: CollectionStatusView) => stagedCount(c.counts).spotify + stagedCount(c.counts).tidal
+/** Per service with changes waiting: how many, how many staged, and whether the bulk button stages or unstages. */
+const bulk = (c: StatusCounts) => PROVIDERS.filter(p => waiting(c)[p] > 0).map(p => ({ p, waiting: waiting(c)[p], staged: stagedCount(c)[p], all: stagedCount(c)[p] === waiting(c)[p] }))
 
 function holdText(h: HoldView): string {
   const service = names[h.provider]
@@ -180,12 +192,13 @@ const mainMark = (row: StatusRowView): Mark => row.main === 'active'
             <div class="label">{{ selected?.kind === 'liked' ? 'Liked songs' : 'Playlist' }}</div>
             <h1 class="display hero-title">{{ selected?.name ?? 'Nothing pulled yet' }}</h1>
           </div>
-          <div class="mono hero-meta">
-            <div v-for="p in PROVIDERS" :key="p" class="hero-service">
-              <ServiceIcon :provider="p" :size="12" :dim="!selected?.on[p]" />
-              {{ serviceLine(selected, p) }}
-            </div>
-          </div>
+          <ul v-if="selected" class="mono presence" aria-label="Where it is">
+            <li v-for="p in PROVIDERS" :key="p" class="chip" :class="{ off: presence(selected, p).dim }" :title="presence(selected, p).label" :aria-label="presence(selected, p).label">
+              <ServiceIcon :provider="p" :size="14" :dim="presence(selected, p).dim" />
+              <span class="chip-text">{{ presence(selected, p).text }}</span>
+              <span class="chip-glyph" aria-hidden="true">{{ presence(selected, p).glyph }}</span>
+            </li>
+          </ul>
         </div>
         <div v-for="h in selected?.holds ?? []" :key="h.id" class="hold" role="status">
           <span class="badge-mini" aria-hidden="true">‖</span>
@@ -198,30 +211,18 @@ const mainMark = (row: StatusRowView): Mark => row.main === 'active'
             <button v-else type="button" class="pill small solid-black" @click="decideHold(h, 'accept')">Accept the removals</button>
           </span>
         </div>
-        <div v-for="p in missingOn(selected)" :key="`missing-${p}`" class="hold" role="status">
-          <template v-if="namesakeOn(selected, p)">
-            <span class="badge-mini" aria-hidden="true">≠</span>
-            <span>
-              Not on <ServiceIcon :provider="p" :size="12" /> {{ names[p] }}, but another "{{ selected!.name }}" ({{ plural(namesakeOn(selected, p)!.songs, 'song') }}) already is.
-              Pushing this one would create a second playlist with that name on {{ names[p] }}.
-            </span>
-            <span class="hold-actions">
-              <button type="button" class="pill small solid-black" @click="selectedKey = namesakeOn(selected, p)!.key">Show the other copy</button>
-              <NuxtLink to="/cleanup" class="pill small outline-dark">Compare on Cleanup</NuxtLink>
-            </span>
-          </template>
-          <template v-else>
-            <span class="badge-mini new" aria-hidden="true">+</span>
-            <span>Not on <ServiceIcon :provider="p" :size="12" /> {{ names[p] }} at all. Pushing creates the playlist there with {{ plural(selected!.songs, 'song') }}.</span>
-          </template>
-        </div>
+        <PushPlan
+          v-for="p in planned(selected)" :key="`plan-${p}`" :provider="p" :collection="selected!"
+          :creates-playlist="missingOn(selected).includes(p)" :namesake="missingOn(selected).includes(p) ? namesakeOn(selected, p) : undefined" :disabled="running"
+          @stage="(change, staged) => stage({ collection: selected!.key, provider: p, change }, staged)" @show="key => selectedKey = key"
+        />
         <div class="hero-foot">
           <div class="pills">
             <span class="pill small outline-dark">{{ plural(selected?.counts.inSync ?? 0, 'song') }} in sync</span>
             <span v-if="selected?.counts.conflicts" class="pill small solid-black">? {{ plural(selected.counts.conflicts, 'conflict') }}</span>
             <span v-for="p in PROVIDERS" v-show="selected?.counts.unavailable[p]" :key="p" class="pill small outline-dark">⊘ {{ selected?.counts.unavailable[p] }} unavailable on {{ names[p] }}</span>
           </div>
-          <PushButton v-if="selected" :waiting="waiting(selected.counts)" small dark />
+          <PushButton v-if="selected" :waiting="waiting(selected.counts)" :staged="stagedCount(selected.counts)" small dark />
         </div>
       </div>
 
@@ -236,7 +237,7 @@ const mainMark = (row: StatusRowView): Mark => row.main === 'active'
             <div class="service-name">{{ names[p] }}</div>
             <div class="mono service-meta">
               <template v-if="pulling(p)">{{ progress?.message }}<span v-if="progress?.total"> · {{ progress.done }}/{{ progress.total }}</span></template>
-              <template v-else-if="library?.services[p].pulledAt">pulled {{ formatWhen(library.services[p].pulledAt!) }} · {{ plural(waiting(library.totals)[p], 'change') }} to push</template>
+              <template v-else-if="library?.services[p].pulledAt">pulled {{ formatWhen(library.services[p].pulledAt!) }} · {{ plural(waiting(library.totals)[p], 'change') }} to push<template v-if="stagedCount(library.totals)[p]">, {{ stagedCount(library.totals)[p].toLocaleString('en-GB') }} staged</template></template>
               <template v-else>never pulled</template>
             </div>
           </div>
@@ -247,7 +248,14 @@ const mainMark = (row: StatusRowView): Mark => row.main === 'active'
         <EqualizerDots class="main-eq" :values="library?.recent ?? []" :columns="20" :animate="running" />
         <div class="main-foot">
           <span class="label">{{ library?.totals.conflicts ? plural(library.totals.conflicts, 'conflict') : 'Whole library' }}</span>
-          <PushButton v-if="library" :waiting="waiting(library.totals)" dark />
+          <span v-if="library && bulk(library.totals).length" class="stage-all">
+            <button
+              v-for="b in bulk(library.totals)" :key="b.p" type="button" class="pill small outline-dark" :disabled="running"
+              :title="b.all ? `Unstage every change for ${names[b.p]}` : `Stage every change waiting for ${names[b.p]}, in every collection`"
+              @click="stage({ provider: b.p }, !b.all)"
+            >{{ b.all ? 'Unstage all' : 'Stage all' }} <ServiceIcon :provider="b.p" :size="11" /></button>
+          </span>
+          <PushButton v-if="library" :waiting="waiting(library.totals)" :staged="stagedCount(library.totals)" dark />
         </div>
       </div>
     </section>
@@ -275,6 +283,7 @@ const mainMark = (row: StatusRowView): Mark => row.main === 'active'
               :class="{ active: c.key === selected?.key }" :title="c.name" @click="selectedKey = c.key"
             >
               <span class="collection-name">{{ c.name }}</span>
+              <span v-if="stagedIn(c)" class="mono count staged" :title="`${stagedIn(c)} staged for the next push`">✓ {{ stagedIn(c) }}</span>
               <span v-if="c.holds.length" class="label amber">held</span>
               <span v-else-if="category(c) === 'followed'" class="label" :title="`${PROVIDERS.filter(p => c.shared[p]).map(p => `${owner(c, p)}'s on ${names[p]}`).join(', ')}`">{{ PROVIDERS.filter(p => c.on[p]).map(p => `${names[p]} copy`)[0] ?? 'only followed' }}</span>
               <span v-else-if="c.counts.conflicts" class="mono count amber">? {{ c.counts.conflicts }}</span>
@@ -348,6 +357,15 @@ const mainMark = (row: StatusRowView): Mark => row.main === 'active'
             </div>
           </div>
           <div class="cell end" :style="{ order: 5 }">
+            <template v-for="p in PROVIDERS" :key="p">
+              <button
+                v-if="row.change[p]" type="button" class="pill small stage-toggle" :class="{ 'solid-mint': row.staged[p] }" :aria-pressed="row.staged[p]"
+                :title="row.staged[p] ? `Staged: the next push to ${names[p]} will ${row.change[p]} this song. Press to unstage` : `Stage: ${row.change[p]} this song with the next push to ${names[p]}`"
+                @click="stage({ collection: selected!.key, track: row.canonicalTrackId, provider: p }, !row.staged[p])"
+              >
+                {{ row.staged[p] ? '✓ Staged' : '+ Stage' }} <ServiceIcon :provider="p" :size="11" />
+              </button>
+            </template>
             <template v-if="row.conflict">
               <button type="button" class="pill small outline-amber" @click="decideConflict(row, 'keep')">Keep</button>
               <button type="button" class="pill small" @click="decideConflict(row, 'remove')">Remove</button>
@@ -364,13 +382,18 @@ const mainMark = (row: StatusRowView): Mark => row.main === 'active'
 .hero { display: flex; flex-direction: column; justify-content: space-between; gap: 24px; min-height: 200px; }
 .hero-head { display: flex; justify-content: space-between; gap: 16px; }
 .hero-title { font-size: clamp(30px, 5vw, 52px); margin-top: 8px; overflow-wrap: anywhere; }
-.hero-meta { text-align: right; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; line-height: 1.9; }
-.hero-service { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+.presence { display: grid; justify-items: stretch; align-content: start; gap: 6px; list-style: none; margin: 0; padding: 0; }
+.chip { display: flex; align-items: center; gap: 8px; min-height: 30px; padding: 0 12px; border-radius: 999px; border: 1.5px solid rgba(0, 0, 0, 0.75); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
+.chip.off { border-style: dashed; border-color: rgba(0, 0, 0, 0.4); color: rgba(0, 0, 0, 0.55); }
+.chip-glyph { font-weight: 700; margin-left: auto; padding-left: 4px; }
 .hero-foot { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
 .pills { display: flex; gap: 8px; flex-wrap: wrap; }
 .hold { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 12px 14px; border-radius: var(--radius-row); background: rgba(0, 0, 0, 0.08); font-size: 14px; }
 .hold-actions { display: flex; gap: 6px; margin-left: auto; }
 .badge-mini.new { color: var(--mint); }
+.stage-all { display: inline-flex; gap: 4px; margin-left: auto; margin-right: 6px; }
+.count.staged { color: var(--mint); }
+.stage-toggle { min-width: 104px; }
 .new-label { display: inline-flex; align-items: center; gap: 4px; }
 .badge-mini { display: inline-grid; place-items: center; width: 24px; height: 24px; border-radius: 50%; background: #000; color: var(--amber); font-weight: 700; font-size: 12px; flex: none; }
 

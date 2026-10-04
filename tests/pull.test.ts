@@ -148,7 +148,33 @@ describe('status', () => {
       conflicts: new Map(),
     })
     expect(Object.fromEntries(rows.map(r => [r.canonicalTrackId, `${r.spotify}/${r.tidal}`]))).toEqual({ 1: 'present/present', 2: 'present/missing', 3: 'extra/absent', 4: 'present/unavailable' })
-    expect(counts).toEqual({ inSync: 1, conflicts: 0, add: { spotify: 0, tidal: 1 }, remove: { spotify: 1, tidal: 0 }, unavailable: { spotify: 0, tidal: 1 } })
+    expect(counts).toEqual({ inSync: 1, conflicts: 0, add: { spotify: 0, tidal: 1 }, remove: { spotify: 1, tidal: 0 }, unavailable: { spotify: 0, tidal: 1 }, staged: { add: { spotify: 0, tidal: 0 }, remove: { spotify: 0, tidal: 0 } }, addUnavailable: { spotify: 0, tidal: 0 } })
+  })
+
+  it('marks a change staged only while the same change still exists', () => {
+    const main = new Map([[1, active()], [2, active()], [3, removed()]])
+    const { rows, counts } = status({
+      main,
+      sides: { spotify: side({ 1: true, 2: true, 3: true }), tidal: side({ 1: true }) },
+      conflicts: new Map(),
+      // 1: staged add, but Tidal already has it. 2: staged add, still missing. 3: staged as an add, but it is now a removal.
+      staged: new Map([[1, { tidal: 'add' }], [2, { tidal: 'add' }], [3, { spotify: 'add' }]]),
+    })
+    const byId = new Map(rows.map(r => [r.canonicalTrackId, r]))
+    expect(byId.get(1)).toMatchObject({ change: { spotify: null, tidal: null }, staged: { spotify: false, tidal: false } })
+    expect(byId.get(2)).toMatchObject({ change: { spotify: null, tidal: 'add' }, staged: { spotify: false, tidal: true } })
+    expect(byId.get(3)).toMatchObject({ change: { spotify: 'remove', tidal: null }, staged: { spotify: false, tidal: false } })
+    expect(counts.staged).toEqual({ add: { spotify: 0, tidal: 1 }, remove: { spotify: 0, tidal: 0 } })
+  })
+
+  it('offers no change for a song in conflict', () => {
+    const { rows } = status({
+      main: new Map([[1, active()]]),
+      sides: { spotify: side({}), tidal: side({ 1: true }) },
+      conflicts: new Map([[1, { provider: 'spotify', change: 'removed' }]]),
+      staged: new Map([[1, { spotify: 'add' }]]),
+    })
+    expect(rows[0]).toMatchObject({ change: { spotify: null, tidal: null }, staged: { spotify: false, tidal: false } })
   })
 
   it('shows a collection missing from a service as all to add, and an unpulled service as unknown', () => {

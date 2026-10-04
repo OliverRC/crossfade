@@ -15,6 +15,7 @@ let runPull: typeof import('../server/jobs/pull').runPull
 let libraryView: typeof import('../server/utils/library').libraryView
 let decisions: typeof import('../server/jobs/decisions')
 let cleanup: typeof import('../server/jobs/cleanup')
+let staging: typeof import('../server/utils/staging')
 
 const t = (id: string, isrc: string | null, over: Partial<ProviderTrack> = {}): ProviderTrack =>
   ({ providerTrackId: id, isrc, title: `Song ${isrc ?? id}`, artists: ['Artist'], album: 'Album', durationMs: 200_000, explicit: false, version: null, ...over })
@@ -79,11 +80,12 @@ beforeAll(async () => {
   libraryView = (await import('../server/utils/library')).libraryView
   decisions = await import('../server/jobs/decisions')
   cleanup = await import('../server/jobs/cleanup')
+  staging = await import('../server/utils/staging')
 })
 
 describe('pull into main', () => {
   beforeEach(() => {
-    for (const table of [schema.unavailableItems, schema.playlistBackups, schema.conflicts, schema.pullHolds, schema.snapshots, schema.memberships, schema.collectionLinks, schema.collections, schema.trackLinks, schema.canonicalTracks, schema.fetchCheckpoints, schema.syncEvents, schema.syncRuns]) db.delete(table).run()
+    for (const table of [schema.stagedChanges, schema.unavailableItems, schema.playlistBackups, schema.conflicts, schema.pullHolds, schema.snapshots, schema.memberships, schema.collectionLinks, schema.collections, schema.trackLinks, schema.canonicalTracks, schema.fetchCheckpoints, schema.syncEvents, schema.syncRuns]) db.delete(table).run()
     quotaOn = null
     // Spotify: liked 1–3, Night Drive 1, 2. Tidal: liked 2–4, Night Drive 1, Gym only on Tidal.
     libraries.spotify = { liked: [S(1), S(2), S(3)], playlists: { sp1: { name: 'Night Drive', tracks: [S(1), S(2)] } } }
@@ -260,5 +262,82 @@ describe('pull into main', () => {
     const again = await pullOf('tidal')
     expect(again.counts).toMatchObject({ removed: 0, held: 0 })
     expect(states('Gym')).toMatchObject({ ISRC7: 'missing/unavailable' })
+    // Pushing Gym to Spotify would still look for song 7 there.
+    expect(collection(libraryView(), 'Gym').counts.addUnavailable).toEqual({ spotify: 1, tidal: 0 })
+  })
+
+  describe('staging (decision 0007)', () => {
+    const key = (name: string) => Number(collection(libraryView(), name).key)
+    const row = (name: string, isrc: string) => rowsOf(name).find(r => r.track.isrc === isrc)!
+    const idOf = (name: string, isrc: string) => row(name, isrc).canonicalTrackId
+
+    it('new changes start unstaged, and one song can be staged for one service', async () => {
+      await pullOf('spotify')
+      await pullOf('tidal')
+      expect(libraryView().totals.staged).toEqual({ add: { spotify: 0, tidal: 0 }, remove: { spotify: 0, tidal: 0 } })
+      expect(row('Liked songs', 'ISRC1')).toMatchObject({ change: { spotify: null, tidal: 'add' }, staged: { spotify: false, tidal: false } })
+
+      expect(staging.setStaged({ collectionId: key('Liked songs'), canonicalTrackId: idOf('Liked songs', 'ISRC1'), provider: 'tidal' }, true)).toBe(1)
+      expect(row('Liked songs', 'ISRC1').staged).toEqual({ spotify: false, tidal: true })
+      expect(libraryView().totals.staged.add).toEqual({ spotify: 0, tidal: 1 })
+      // Staging twice changes nothing.
+      expect(staging.setStaged({ collectionId: key('Liked songs'), canonicalTrackId: idOf('Liked songs', 'ISRC1'), provider: 'tidal' }, true)).toBe(0)
+
+      const view = staging.stagedView()
+      expect(view.tidal).toMatchObject({ add: 1, remove: 0, collections: [{ name: 'Liked songs', createsPlaylist: false, add: [{ isrc: 'ISRC1' }], remove: [] }] })
+      expect(view.spotify).toEqual({ collections: [], add: 0, remove: 0 })
+    })
+
+    it('stages a collection or a service in bulk, and unstages it again', async () => {
+      await pullOf('spotify')
+      await pullOf('tidal')
+      expect(staging.setStaged({ provider: 'spotify' }, true)).toBe(2)
+      expect(libraryView().totals.staged.add).toEqual({ spotify: 2, tidal: 0 })
+      // Gym is only on Tidal: pushing it to Spotify creates the playlist.
+      expect(staging.stagedView().spotify.collections.find(c => c.name === 'Gym')).toMatchObject({ createsPlaylist: true })
+
+      expect(staging.setStaged({ collectionId: key('Night Drive') }, true)).toBe(1)
+      expect(libraryView().totals.staged.add).toEqual({ spotify: 2, tidal: 1 })
+      expect(staging.setStaged({}, false)).toBe(3)
+      expect(db.select().from(schema.stagedChanges).all()).toEqual([])
+    })
+
+    it('a song in conflict cannot be staged until the conflict is decided', async () => {
+      await pullOf('spotify')
+      await pullOf('tidal')
+      libraries.tidal.playlists.tp1!.tracks = [T(1), T(2)]
+      await pullOf('tidal')
+      libraries.spotify.playlists.sp1!.tracks = [S(1)]
+      await pullOf('spotify')
+      const id = idOf('Night Drive', 'ISRC2')
+      expect(staging.setStaged({ collectionId: key('Night Drive'), canonicalTrackId: id }, true)).toBe(0)
+      decisions.resolveConflict(row('Night Drive', 'ISRC2').conflict!.id, 'keep')
+      expect(staging.setStaged({ collectionId: key('Night Drive'), canonicalTrackId: id }, true)).toBe(1)
+    })
+
+    it('a staged change the service already matches is stale, and leaves the stage', async () => {
+      await pullOf('spotify')
+      await pullOf('tidal')
+      staging.setStaged({ provider: 'tidal' }, true)
+      expect(libraryView().totals.staged.add.tidal).toBe(2)
+      // Song 1 reaches Tidal's liked songs some other way.
+      libraries.tidal.liked = [T(1), T(2), T(3), T(4)]
+      await pullOf('tidal')
+      expect(libraryView().totals.staged.add.tidal).toBe(1)
+      expect(staging.pruneStaged()).toBe(1)
+      expect(db.select().from(schema.stagedChanges).all()).toHaveLength(1)
+    })
+
+    it('a staged add does not count once main removes the song', async () => {
+      await pullOf('spotify')
+      await pullOf('tidal')
+      staging.setStaged({ collectionId: key('Liked songs'), provider: 'tidal' }, true)
+      libraries.spotify.liked = [S(2), S(3)]
+      await pullOf('spotify')
+      // Removed from main and on neither service: settled, so not even a row.
+      expect(rowsOf('Liked songs').some(r => r.track.isrc === 'ISRC1')).toBe(false)
+      expect(libraryView().totals.staged.add.tidal).toBe(0)
+      expect(staging.pruneStaged()).toBe(1)
+    })
   })
 })

@@ -8,6 +8,7 @@ import { PROVIDERS } from '../../shared/types'
 import { schema, useDb } from '../utils/db'
 import { acquire, lockHolder, release } from './lock'
 import { runPull } from './pull'
+import { pruneStaged } from '../utils/staging'
 import { providerNames } from './quota'
 import { createRunLog, resetUnfinishedStages } from './run-log'
 
@@ -98,6 +99,9 @@ export function startPull(provider: ProviderId, trigger: 'manual' | 'schedule' =
           update({ running: false, phase: 'paused', message: `${pause.message}. Progress is saved; continuing automatically.` })
           schedulePull(provider, pause.resumeAt)
         } else {
+          // A staged change the service now already matches has nothing left to push.
+          const dropped = pruneStaged()
+          if (dropped) log.event('info', null, `${dropped} staged ${dropped === 1 ? 'change is' : 'changes are'} no longer needed and left the stage`)
           log.event('info', null, `Finished after ${run.attempts === 1 ? 'one attempt' : `${run.attempts} attempts`}. Main is up to date with ${name}; nothing was written to either service`)
           update({ running: false, phase: 'done', message: `Pulled ${name}. Nothing was written to either service.` })
         }

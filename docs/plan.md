@@ -14,7 +14,7 @@ Guiding principles:
 
 - Never surprise the user. Pull only reads a service and updates main. Push is the only thing that writes to a service, and it always shows its changes first.
 - Hard-match first: ISRC before anything fuzzy, because a wrong link is worse than a missing one.
-- Remember human decisions: a confirmed match, a held-back change, a resolved conflict is stored and never asked again.
+- Remember human decisions: a confirmed match, a staged change, a resolved conflict is stored and never asked again.
 - State, not events: failures, unmatched songs and holds are states on the item, and they clear themselves once resolved.
 - Simple over clever: full snapshots, in-memory diffing, one SQLite file, one container.
 
@@ -28,7 +28,8 @@ Reading and writing have different costs and risks. Reading Tidal costs nothing 
 | remotes | `spotify` and `tidal`, equal peers; neither is the origin |
 | remote-tracking branch | Each service's snapshot from its last pull |
 | `pull spotify` | Read Spotify, work out what changed since its last snapshot, apply that to main. Never writes to a service |
-| `push tidal` | Make Tidal match main: preview the adds and removals, then write them when Oliver presses Push |
+| `git add` | Stage a change for the next push to one service (`0007`) |
+| `push tidal` | Send the changes staged for Tidal: preview them, then write them when Oliver presses Push |
 | `status` | Per collection and service: what the service is missing compared with main |
 | merge conflict | A pull that would undo a newer change in main stops on that song and asks |
 | `--force-with-lease` | Push re-reads the collection before writing and writes only what is still needed |
@@ -46,7 +47,8 @@ MVP:
   - Collaborative playlists owned by someone else are read and pushed like owned ones (`0006`).
   - Followed playlists owned by someone else are listed and paired by name so their copies on the other service are not treated as missing, but they are never read or pushed: Spotify returns 403 for their items (`0006`).
 - Pull per service, with snapshots, conflicts, and a sanity guard against bad reads.
-- Push per service, with a preview, hold-back, ISRC lookup at push time, a fresh read before writing, and per-song results.
+- Staging: pick which changes the next push to each service carries (`0007`).
+- Push per service of what is staged, with a preview, ISRC lookup at push time, a fresh read before writing, and per-song results.
 - Automatic ISRC matching; fuzzy candidates proposed for review; a manual search override.
 - Unmatched songs recorded with a reason, not dropped. Songs a service no longer offers stay in main, marked unavailable there.
 - Tidal playlist cleanup: merge exact duplicate copies and remove empty playlists, confirmed on the Cleanup page (`0004`).
@@ -193,20 +195,29 @@ Status is derived, not stored: for each collection and service it compares main 
 - **Not compared**: the service's copy is a followed playlist, or the service has not been pulled yet.
 - **New playlist**: on main but not on the service at all; push would create it. If a same-named playlist is already there, the Library warns that pushing would make a second copy.
 
-This is the plan's persistent queue, recast: "changes not pushed yet" falls out of main and the snapshots, and only decisions (held-back changes, resolved conflicts, accepted holds) are stored.
+This is the plan's persistent queue, recast: "changes not pushed yet" falls out of main and the snapshots, and only decisions (staged changes, resolved conflicts, accepted holds) are stored.
+
+## Staging
+
+Push sends only the changes Oliver staged (`0007`). New changes start unstaged.
+
+- Stage one song on one service from its row, a whole collection per service from the hero card, or everything for a service from the Main card.
+- Staging is stored per collection, song and service. A pick counts only while the same change still exists; stale picks are pruned after each pull.
+- A song in conflict cannot be staged until the conflict is decided.
+- The Staged page shows what each push will do, removals apart from adds, and new playlists called out.
 
 ## Push (M5)
 
-Push makes one service match main. It is the only code path that writes to Spotify or Tidal.
+Push sends the changes staged for one service. It is the only code path that writes to Spotify or Tidal.
 
 1. Take the run lock and create a run (kind push).
-2. Show the preview: songs to add and to remove per collection, removals listed separately, new playlists called out. Oliver can hold back any change; held-back changes stay held and are not asked about again.
+2. Show the preview (the Staged page): songs to add and to remove per collection, removals listed separately, new playlists called out.
 3. Look up each song to add on the target service: an existing link, else ISRC lookup (Spotify rationed per run and paused on quota, Tidal 20 at a time). Misses go to fuzzy search, which proposes candidates for review and never auto-links.
 4. Re-read each affected collection and write only what is still needed. Spotify playlists accept duplicates, so a blind add would create them.
 5. Write in batches per collection (Spotify 40 for liked, Tidal 50), recording a result per song. Retry 429 and 5xx up to 3 times honouring `Retry-After`; already-present on add and already-absent on remove count as success.
-6. Update the snapshot from what actually succeeded. A failed write keeps a failed state with its error and is retried on the next push; a later success clears it.
+6. Update the snapshot from what actually succeeded, which clears those changes from the stage. A failed write stays staged with its error and is retried on the next push; a later success clears it.
 
-The push button follows where changes are waiting: Push to Spotify, Push to Tidal, or Push to both as a split button. Every button shows its count and opens the preview first. The same buttons appear per collection and for the whole library.
+The push button follows where staged changes are waiting: Push to Spotify, Push to Tidal, or Push to both as a split button. Every button shows its staged count and opens the preview first. The same buttons appear per collection and for the whole library.
 
 Tidal playlist cleanup (`0004`) writes to Tidal directly today, like `git gc`. Once push exists, cleanup writes should go through the same write path.
 
@@ -236,11 +247,17 @@ The main screen is a diff tool: Spotify on the left, main in the middle, Tidal o
 ### Library (home)
 
 - A service card per side: Pull Spotify and Pull Tidal (or Resume after a pause), with the last pull time, changes waiting to push, and live progress over SSE.
-- The push button, showing where changes wait; disabled until M5.
+- The push button, showing where staged changes wait; it opens the Staged page.
 - Sidebar: Liked songs, then playlists grouped Mine, Collab and Followed. Within a tab, collections that need attention come before those in sync. Badges show conflicts, differences, holds, and "new" for playlists push would create.
-- Hero card for the selected collection: where it lives on each service (owned, with someone, or followed), held pulls with their decision buttons, and new-playlist or same-name warnings.
+- Hero card for the selected collection: a chip per service showing where it lives (icon greyed out with ✗ when it is not there, ✓ when it is, – when followed, "with Niki" when collaborative), and held pulls with their decision buttons.
+- A push plan per service with changes, as numbered steps: create the playlist (only when the service lacks it, with any same-name warning), add n songs (noting songs unavailable on the other service that push will still look for), remove n songs. Each step shows ○ ◐ ● for how much is staged and stages on its own; Stage all stages the plan. Push progress will report against these steps.
 - Rows aligned by canonical song. Each side shows its copy or a gap; the action column says what push would do, with a Spotify · main · Tidal strip of ticks and crosses. Default filter is differences only; a toggle shows everything.
 - Conflicts are decided on the row: keep in main or remove from main.
+- Each change has a Stage toggle per service; the hero card's push plans stage a collection's steps, and the Main card stages everything for a service.
+
+### Staged
+
+- What the next push to each service will do: removals first and apart, then adds per collection, new playlists and collaborative playlists called out. Unstage per song, per playlist or per service. The Push button here does the writing (M5 slice 2 onwards).
 
 ### Other screens
 
@@ -295,7 +312,7 @@ Work one milestone at a time and stop at each "Done when" for Oliver to verify. 
 | V0 Login, connections, read adapters, dry-run diff | Done. Its dry-run sync was replaced by pull |
 | Tidal playlist cleanup | Done (`0004`) |
 | **M4 Main and pull** | **In progress**: pull, conflicts, holds, status and the Library page work; awaiting Oliver's check on the real library |
-| M5 Push | Next |
+| **M5 Push** | **In progress**: slice 1 (staging) built; push to Tidal next |
 | M3 Manual search and review | After M5 |
 | Docker and Unraid | Whenever deployment is wanted |
 | M6 Automation | Phase 2 |
@@ -313,8 +330,11 @@ Done when: pulling Tidal then Spotify builds a main Oliver agrees with, the Libr
 
 ### M5 Push (MVP complete)
 
-- [ ] Preview per service with removals separate, and hold-back.
-- [ ] ID lookup at push time, rationed for Spotify, paused and resumed on quota.
+Built in slices (`0007`):
+
+- [x] Staging: per-song, per-collection and per-service staging, and the Staged page as the push preview.
+- [ ] Push to Tidal, tried on the test playlist first.
+- [ ] Push to Spotify: ID lookup at push time, rationed, paused and resumed on quota.
 - [ ] Fresh read before writing, per-song results, retries and failure states.
 - [ ] Creating playlists on the other service.
 - [ ] Route cleanup writes through push.

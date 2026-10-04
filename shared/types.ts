@@ -51,6 +51,10 @@ export interface StatusCounts {
   add: Record<ProviderId, number>
   remove: Record<ProviderId, number>
   unavailable: Record<ProviderId, number>
+  /** Of those adds and removals, the ones staged for the next push (docs/decisions/0007). */
+  staged: { add: Record<ProviderId, number>, remove: Record<ProviderId, number> }
+  /** Of the adds, songs the other service lists but does not offer: push still looks for them by ISRC. */
+  addUnavailable: Record<ProviderId, number>
 }
 
 export interface StatusRowView {
@@ -61,6 +65,9 @@ export interface StatusRowView {
   spotify: SideState
   tidal: SideState
   conflict: { id: number, provider: ProviderId, change: 'added' | 'removed' } | null
+  /** The change a push would make on each service, and whether it is staged. */
+  change: Record<ProviderId, 'add' | 'remove' | null>
+  staged: Record<ProviderId, boolean>
 }
 
 export interface HoldView {
@@ -105,6 +112,22 @@ export interface LibraryView {
   /** Songs added or removed in main by each of the last 20 pulls, oldest first. */
   recent: number[]
 }
+
+/** One collection's staged changes for one service. */
+export interface StagedCollectionView {
+  key: string
+  kind: 'liked' | 'playlist'
+  name: string
+  /** The playlist is not on the service yet: push creates it first. */
+  createsPlaylist: boolean
+  /** Someone else's collaborative playlist: a push edits theirs. */
+  ownerName: string | null
+  add: (TrackView & { canonicalTrackId: number })[]
+  remove: (TrackView & { canonicalTrackId: number })[]
+}
+
+/** What the next push to each service would do (docs/decisions/0007). */
+export type StagedView = Record<ProviderId, { collections: StagedCollectionView[], add: number, remove: number }>
 
 export interface QuotaView {
   /** True while requests are held back; false once the retry time has passed. */

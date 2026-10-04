@@ -17,7 +17,11 @@ export interface StatusInput {
   sides: Record<ProviderId, StatusSide>
   /** Songs with an open conflict, and which service's pull raised it. */
   conflicts: Map<number, { provider: ProviderId, change: 'added' | 'removed' }>
+  /** Changes picked for the next push, per song and service (docs/decisions/0007). Stale ones are ignored. */
+  staged?: Map<number, Partial<Record<ProviderId, Change>>>
 }
+
+export type Change = 'add' | 'remove'
 
 export interface StatusRow {
   canonicalTrackId: number
@@ -25,6 +29,10 @@ export interface StatusRow {
   conflict: { provider: ProviderId, change: 'added' | 'removed' } | null
   spotify: SideState
   tidal: SideState
+  /** The change a push would make on each service, if any. */
+  change: Record<ProviderId, Change | null>
+  /** That change is staged for the next push. */
+  staged: Record<ProviderId, boolean>
 }
 
 function sideState(entry: MainEntry, side: StatusSide, id: number): SideState {
@@ -38,20 +46,30 @@ function sideState(entry: MainEntry, side: StatusSide, id: number): SideState {
   return available === undefined ? 'absent' : 'extra'
 }
 
+const changeFor = (s: SideState): Change | null => (s === 'missing' ? 'add' : s === 'extra' ? 'remove' : null)
+
 const RANK: Record<SideState, number> = { missing: 1, extra: 1, unavailable: 2, unknown: 3, present: 4, absent: 4, followed: 4 }
 
 export function status(input: StatusInput): { rows: StatusRow[], counts: StatusCounts } {
   const zero = () => ({ spotify: 0, tidal: 0 })
-  const counts: StatusCounts = { inSync: 0, conflicts: 0, add: zero(), remove: zero(), unavailable: zero() }
+  const counts: StatusCounts = { inSync: 0, conflicts: 0, add: zero(), remove: zero(), unavailable: zero(), staged: { add: zero(), remove: zero() }, addUnavailable: zero() }
   const rows: StatusRow[] = []
 
   for (const [id, entry] of input.main) {
+    const conflict = input.conflicts.get(id) ?? null
+    const spotify = sideState(entry, input.sides.spotify, id)
+    const tidal = sideState(entry, input.sides.tidal, id)
+    // A conflict is decided before anything about the song is pushed.
+    const change = { spotify: conflict ? null : changeFor(spotify), tidal: conflict ? null : changeFor(tidal) }
+    const picked = input.staged?.get(id)
     const row: StatusRow = {
       canonicalTrackId: id,
       main: entry.state,
-      conflict: input.conflicts.get(id) ?? null,
-      spotify: sideState(entry, input.sides.spotify, id),
-      tidal: sideState(entry, input.sides.tidal, id),
+      conflict,
+      spotify,
+      tidal,
+      change,
+      staged: { spotify: change.spotify !== null && picked?.spotify === change.spotify, tidal: change.tidal !== null && picked?.tidal === change.tidal },
     }
     // A song removed from main and gone from both services is settled history, not a row.
     if (!row.conflict && row.spotify !== 'extra' && row.tidal !== 'extra' && entry.state === 'removed') continue
@@ -62,6 +80,9 @@ export function status(input: StatusInput): { rows: StatusRow[], counts: StatusC
       if (row[p] === 'missing') counts.add[p]++
       if (row[p] === 'extra') counts.remove[p]++
       if (row[p] === 'unavailable') counts.unavailable[p]++
+      if (row.staged[p]) counts.staged[row.change[p]!][p]++
+      // An add whose copy elsewhere is listed but not playable: push still looks it up on this service by ISRC.
+      if (row.change[p] === 'add' && PROVIDERS.some(o => o !== p && row[o] === 'unavailable')) counts.addUnavailable[p]++
     }
     if (PROVIDERS.every(p => row[p] === 'present' || row[p] === 'followed')) counts.inSync++
   }

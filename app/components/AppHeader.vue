@@ -7,6 +7,7 @@ const route = useRoute()
 
 const nav = [
   { to: '/', label: 'Library' },
+  { to: '/staged', label: 'Staged' },
   { to: null, label: 'Review', note: 'M3' },
   { to: null, label: 'Unmatched', note: 'M3' },
   { to: '/cleanup', label: 'Cleanup' },

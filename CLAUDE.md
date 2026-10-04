@@ -5,7 +5,7 @@ Self-hosted two-way sync of one person's Spotify and Tidal libraries (liked song
 ## Status
 
 - Current milestone: **M4 Main and pull** (`docs/decisions/0005`). Done when pulling Tidal then Spotify builds a main Oliver agrees with, the Library page shows what each service is missing, and pulling again with nothing changed reports nothing new. V0 is done; its dry-run sync was replaced by pull.
-- Next: M5 (push), then M3 (manual search and review). A one-press sync (pull both, push both) waits until pull and push are trusted. Docker and Unraid packaging can slot in whenever he wants it deployed.
+- In progress: M5 (push), in slices (`docs/decisions/0007`): staging is built (push sends only staged changes; new changes start unstaged), push to Tidal is next, then Spotify, then creating playlists. M3 (manual search and review) follows M5. A one-press sync (pull both, push both) waits until pull and push are trusted. Docker and Unraid packaging can slot in whenever he wants it deployed.
 - Pulls are checkpointed and resumable, and pause on quota (`docs/decisions/0003`). Spotify's Development Mode quota is unpublished, with reported cooldowns of 13 to 18 hours: never retry `QUOTA_EXCEEDED`, and keep Spotify lookups rationed (they belong to push).
 - Work one milestone at a time. Stop at each milestone's "Done when" for Oliver to verify.
 

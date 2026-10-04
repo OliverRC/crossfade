@@ -213,3 +213,16 @@ export const pullHolds = sqliteTable('pull_holds', {
    */
   resolution: text('resolution').$type<'accepted' | 'superseded' | 'kept' | 'removed'>(),
 })
+
+/**
+ * A change picked for the next push to one service (docs/decisions/0007). The change itself is derived from main and
+ * the service's snapshot; a staged row whose change no longer exists is stale and is pruned.
+ */
+export const stagedChanges = sqliteTable('staged_changes', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  collectionId: integer('collection_id').notNull().references(() => collections.id, { onDelete: 'cascade' }),
+  canonicalTrackId: integer('canonical_track_id').notNull().references(() => canonicalTracks.id, { onDelete: 'cascade' }),
+  provider: text('provider').$type<ProviderId>().notNull(),
+  change: text('change').$type<'add' | 'remove'>().notNull(),
+  stagedAt: text('staged_at').notNull(),
+}, t => [uniqueIndex('staged_changes_collection_track_provider').on(t.collectionId, t.canonicalTrackId, t.provider)])

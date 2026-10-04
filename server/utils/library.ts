@@ -4,13 +4,22 @@ import type { CollectionStatusView, LibraryView, ProviderId, RunStatus, StatusCo
 import { PROVIDERS } from '../../shared/types'
 import type { MainEntry } from '../core/pull'
 import { normaliseText } from '../core/normalise'
-import { rowState, status, type StatusInput } from '../core/status'
+import { rowState, status, type Change, type StatusInput } from '../core/status'
 import { schema, useDb } from './db'
 
 const zero = () => ({ spotify: 0, tidal: 0 })
-const emptyCounts = (): StatusCounts => ({ inSync: 0, conflicts: 0, add: zero(), remove: zero(), unavailable: zero() })
+const emptyCounts = (): StatusCounts => ({ inSync: 0, conflicts: 0, add: zero(), remove: zero(), unavailable: zero(), staged: { add: zero(), remove: zero() }, addUnavailable: zero() })
 
-export function libraryView(selectedKey?: string): LibraryView {
+/** Main and each service's last pull for one collection: what status compares. */
+export interface CollectionInput {
+  collection: typeof schema.collections.$inferSelect
+  links: (typeof schema.collectionLinks.$inferSelect)[]
+  holds: (typeof schema.pullHolds.$inferSelect)[]
+  input: StatusInput
+}
+
+/** Every collection worth showing, with its status input. */
+export function collectionInputs(): CollectionInput[] {
   const db = useDb()
   const collections = db.select().from(schema.collections).all()
   const links = db.select().from(schema.collectionLinks).all()
@@ -18,32 +27,55 @@ export function libraryView(selectedKey?: string): LibraryView {
   const memberships = db.select().from(schema.memberships).all()
   const openConflicts = db.select().from(schema.conflicts).where(isNull(schema.conflicts.resolvedAt)).all()
   const openHolds = db.select().from(schema.pullHolds).where(isNull(schema.pullHolds.resolvedAt)).all()
+  const staged = db.select().from(schema.stagedChanges).all()
   const pulled = Object.fromEntries(PROVIDERS.map(p => [p, snapshots.some(s => s.provider === p)])) as Record<ProviderId, boolean>
 
-  const inputs = new Map<number, StatusInput>()
-  const views: CollectionStatusView[] = []
-  const totals = { ...emptyCounts(), held: openHolds.length }
+  const out: CollectionInput[] = []
   for (const c of collections) {
     const main = new Map<number, MainEntry>(memberships.filter(m => m.collectionId === c.id).map(m => [m.canonicalTrackId, { state: m.state, changedAt: m.changedAt, changedBy: m.changedBy }]))
     const own = links.filter(l => l.collectionId === c.id)
+    const holds = openHolds.filter(h => h.collectionId === c.id)
     const followedOn = (p: ProviderId) => own.some(l => l.provider === p && l.access === 'followed')
     // A followed playlist with no copy anywhere readable has no songs in main, but is still listed.
-    if (!main.size && !openHolds.some(h => h.collectionId === c.id) && !PROVIDERS.some(followedOn)) continue
+    if (!main.size && !holds.length && !PROVIDERS.some(followedOn)) continue
     const sides = Object.fromEntries(PROVIDERS.map((p) => {
       const snap = snapshots.find(s => s.provider === p && s.collectionId === c.id)
       return [p, { pulled: pulled[p], items: snap ? new Map(snap.items.map(i => [i.canonicalTrackId, i.available])) : null, followed: followedOn(p) }]
     })) as StatusInput['sides']
-    const input: StatusInput = {
-      main,
-      sides,
-      conflicts: new Map(openConflicts.filter(x => x.collectionId === c.id).map(x => [x.canonicalTrackId, { provider: x.provider, change: x.change }])),
-    }
+    const picked = new Map<number, Partial<Record<ProviderId, Change>>>()
+    for (const s of staged.filter(x => x.collectionId === c.id)) picked.set(s.canonicalTrackId, { ...picked.get(s.canonicalTrackId), [s.provider]: s.change })
+    out.push({
+      collection: c,
+      links: own,
+      holds,
+      input: {
+        main,
+        sides,
+        conflicts: new Map(openConflicts.filter(x => x.collectionId === c.id).map(x => [x.canonicalTrackId, { provider: x.provider, change: x.change }])),
+        staged: picked,
+      },
+    })
+  }
+  return out
+}
+
+export function libraryView(selectedKey?: string): LibraryView {
+  const db = useDb()
+  const openConflicts = db.select().from(schema.conflicts).where(isNull(schema.conflicts.resolvedAt)).all()
+  const all = collectionInputs()
+  const inputs = new Map<number, StatusInput>()
+  const views: CollectionStatusView[] = []
+  const totals = { ...emptyCounts(), held: all.reduce((n, x) => n + x.holds.length, 0) }
+  for (const { collection: c, links: own, holds, input } of all) {
     inputs.set(c.id, input)
     const { counts } = status(input)
     for (const p of PROVIDERS) {
       totals.add[p] += counts.add[p]
       totals.remove[p] += counts.remove[p]
       totals.unavailable[p] += counts.unavailable[p]
+      totals.staged.add[p] += counts.staged.add[p]
+      totals.staged.remove[p] += counts.staged.remove[p]
+      totals.addUnavailable[p] += counts.addUnavailable[p]
     }
     totals.inSync += counts.inSync
     totals.conflicts += counts.conflicts
@@ -54,9 +86,9 @@ export function libraryView(selectedKey?: string): LibraryView {
       on: Object.fromEntries(PROVIDERS.map(p => [p, own.some(l => l.provider === p && l.access !== 'followed')])) as Record<ProviderId, boolean>,
       shared: Object.fromEntries(own.filter(l => l.access !== 'owned').map(l => [l.provider, { access: l.access as 'collaborative' | 'followed', ownerName: l.ownerName }])),
       counts,
-      songs: [...main.values()].filter(m => m.state === 'active').length,
+      songs: [...input.main.values()].filter(m => m.state === 'active').length,
       namesakes: [],
-      holds: openHolds.filter(h => h.collectionId === c.id).map(h => ({ id: h.id, provider: h.provider, reason: h.reason, before: h.before, removing: h.removing, detectedAt: h.detectedAt, runId: h.runId })),
+      holds: holds.map(h => ({ id: h.id, provider: h.provider, reason: h.reason, before: h.before, removing: h.removing, detectedAt: h.detectedAt, runId: h.runId })),
     })
   }
   const byName = Map.groupBy(views.filter(v => v.kind === 'playlist'), v => normaliseText(v.name))
@@ -84,6 +116,8 @@ export function libraryView(selectedKey?: string): LibraryView {
         spotify: r.spotify,
         tidal: r.tidal,
         conflict: r.conflict ? { id: conflictIds.get(r.canonicalTrackId)!, ...r.conflict } : null,
+        change: r.change,
+        staged: r.staged,
       }
     })
   }
