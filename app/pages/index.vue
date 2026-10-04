@@ -325,7 +325,7 @@ const mainMark = (row: StatusRowView): Mark => row.main === 'active'
                 <span v-if="row[p] === 'extra'" class="tag coral">− removed in main</span>
               </div>
             </template>
-            <span v-else class="pill small dashed">{{ row[p] === 'missing' && missingOn(selected).includes(p) ? 'No playlist here yet' : gapLabel[row[p]] }}</span>
+            <span v-else class="pill small dashed">{{ row[p] === 'missing' && missingOn(selected).includes(p) ? 'No Playlist' : gapLabel[row[p]] }}</span>
           </div>
           <StateBadge :state="row.state" :style="{ order: 2 }" />
           <div class="cell" :style="{ order: 4 }">
