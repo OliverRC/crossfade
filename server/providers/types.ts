@@ -37,8 +37,12 @@ export type WriteFailures = Map<string, string>
  */
 export interface PushWriter {
   readonly id: ProviderId
-  /** A track this service offers in the account's country, per ISRC that has one. */
-  findPlayableByIsrcs(isrcs: string[]): Promise<Map<string, string>>
+  /** ISRCs per findPlayableByIsrcs call, so a lookup budget or quota error stops between calls. */
+  readonly isrcBatchSize: number
+  /** Requests one push may spend on lookups before leaving the rest for the next push; null for no limit. */
+  readonly lookupBudget: number | null
+  /** A track this service offers, per ISRC that has one, and the requests that cost. */
+  findPlayableByIsrcs(isrcs: string[]): Promise<{ found: Map<string, string>, requests: number }>
   /** The playlist's entries now, or null when it no longer exists. */
   readPlaylist(playlistId: string): Promise<PlaylistEntry[] | null>
   addToPlaylist(playlistId: string, trackIds: string[]): Promise<WriteFailures>

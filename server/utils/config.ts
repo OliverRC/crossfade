@@ -18,3 +18,9 @@ export function providerCredentials(provider: ProviderId): { clientId: string, c
 export function redirectUri(provider: ProviderId): string {
   return `${publicBaseUrl()}/auth/${provider}/callback`
 }
+
+/** Spotify lookups (search requests) one push may spend before leaving the rest staged; the quota is unpublished. */
+export function spotifyLookupBudget(): number {
+  const n = Number(process.env.SPOTIFY_LOOKUPS_PER_RUN)
+  return Number.isFinite(n) && n > 0 ? n : 150
+}

@@ -312,7 +312,7 @@ Work one milestone at a time and stop at each "Done when" for Oliver to verify. 
 | V0 Login, connections, read adapters, dry-run diff | Done. Its dry-run sync was replaced by pull |
 | Tidal playlist cleanup | Done (`0004`) |
 | **M4 Main and pull** | **In progress**: pull, conflicts, holds, status and the Library page work; awaiting Oliver's check on the real library |
-| **M5 Push** | **In progress**: staging and push to Tidal built; first real push to Tidal waiting for Oliver; push to Spotify next |
+| **M5 Push** | **In progress**: staging, push to Tidal and push to Spotify built; first real pushes waiting for Oliver; creating playlists next |
 | M3 Manual search and review | After M5 |
 | Docker and Unraid | Whenever deployment is wanted |
 | M6 Automation | Phase 2 |
@@ -334,7 +334,7 @@ Built in slices (`0007`):
 
 - [x] Staging: per-song, per-collection and per-service staging, and the Staged page as the push preview.
 - [x] Push to Tidal: ISRC lookup, playlists re-read before writing, idempotent liked-song writes, per-song results and failure states (`0007`). First real push to be tried on a test playlist.
-- [ ] Push to Spotify: ID lookup at push time, rationed, paused and resumed on quota.
+- [x] Push to Spotify: ID lookup at push time, rationed per push; stops on quota and the rest stays staged (`0007`).
 - [ ] Fresh read before writing, per-song results, retries and failure states.
 - [ ] Creating playlists on the other service.
 - [ ] Route cleanup writes through push.

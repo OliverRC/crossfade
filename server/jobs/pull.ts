@@ -305,8 +305,15 @@ function linkTracks(fetched: FetchedCollection[]): { ids: Map<string, number>, c
     for (const col of fetched) {
       for (const t of col.tracks) {
         if (ids.has(t.providerTrackId)) continue
+        const copy = { isrc: t.isrc, title: t.title, album: t.album }
         const existing = linkByProviderTrack.get(t.providerTrackId)
-        if (existing) { ids.set(t.providerTrackId, existing.canonicalTrackId); continue }
+        if (existing) {
+          if (existing.isrc !== copy.isrc || existing.title !== copy.title || existing.album !== copy.album) {
+            tx.update(schema.trackLinks).set(copy).where(eq(schema.trackLinks.id, existing.id)).run()
+          }
+          ids.set(t.providerTrackId, existing.canonicalTrackId)
+          continue
+        }
 
         let canonicalId = t.isrc ? canonicalByIsrc.get(t.isrc) : undefined
         const method = canonicalId ? 'isrc' : 'origin'
@@ -325,7 +332,7 @@ function linkTracks(fetched: FetchedCollection[]): { ids: Map<string, number>, c
         for (const id of placeholders) tx.delete(schema.trackLinks).where(eq(schema.trackLinks.id, id)).run()
 
         const link = tx.insert(schema.trackLinks).values({
-          canonicalTrackId: canonicalId, provider, providerTrackId: t.providerTrackId, status: 'matched',
+          canonicalTrackId: canonicalId, provider, providerTrackId: t.providerTrackId, ...copy, status: 'matched',
           method, confidence: 1, isPreferred: !hasPreferred, lastCheckedAt: now(),
         }).returning().get()
         linkByProviderTrack.set(t.providerTrackId, link)

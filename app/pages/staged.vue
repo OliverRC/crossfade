@@ -14,8 +14,13 @@ const confirming = ref<ProviderId | null>(null)
 const names = { spotify: 'Spotify', tidal: 'Tidal' } as const
 const PROVIDERS = ['spotify', 'tidal'] as const
 /** Services push can write to so far (M5 slice 2: Tidal). */
-const PUSHABLE: ProviderId[] = ['tidal']
-const NOT_YET = 'Push to Spotify comes in the next step of M5. Staging is saved until then.'
+const PUSHABLE: ProviderId[] = ['spotify', 'tidal']
+const NOT_YET = 'This service cannot be pushed to yet. Staging is saved until then.'
+/** The service is rate limited: nothing may be sent until it clears. */
+const blockedUntil = (p: ProviderId) => {
+  const q = connections.value?.find(c => c.provider === p)?.quota
+  return q?.blocked ? q.retryAt : null
+}
 const total = computed(() => PROVIDERS.reduce((n, p) => n + (view.value?.[p].add ?? 0) + (view.value?.[p].remove ?? 0), 0))
 const plural = (n: number, word: string) => `${n.toLocaleString('en-GB')} ${word}${n === 1 ? '' : 's'}`
 const fmtDuration = (ms: number) => `${Math.floor(ms / 60000)}:${String(Math.round((ms % 60000) / 1000)).padStart(2, '0')}`
@@ -88,7 +93,8 @@ const where = (c: StagedCollectionView) => [
             </span>
             <button type="button" class="pill small" :disabled="running" @click="unstage({ provider: p })">Unstage all</button>
             <button
-              type="button" class="pill small solid-coral" :disabled="!PUSHABLE.includes(p) || running" :title="PUSHABLE.includes(p) ? '' : NOT_YET"
+              type="button" class="pill small solid-coral" :disabled="!PUSHABLE.includes(p) || running || Boolean(blockedUntil(p))"
+              :title="running ? 'A pull or push is running; push when it finishes' : blockedUntil(p) ? `${names[p]} is rate limited until ${formatWhen(blockedUntil(p)!)}` : PUSHABLE.includes(p) ? '' : NOT_YET"
               @click="confirming = p"
             >{{ running && progress?.provider === p ? 'Pushing…' : `Push to ${names[p]}` }}</button>
           </div>
@@ -99,6 +105,13 @@ const where = (c: StagedCollectionView) => [
             <strong>Write to {{ names[p] }} now?</strong>
             This adds {{ plural(view[p].add - waitingForCreate(p), 'song') }}<template v-if="view[p].remove"> and <strong class="coral-text">removes {{ plural(view[p].remove, 'song') }}</strong> (listed below)</template>.
             Each playlist is read again first and only what it still needs is written. Songs that fail stay staged with the reason.
+          </p>
+          <p v-if="view[p].needsLookup" class="muted">
+            {{ plural(view[p].needsLookup, 'song') }} {{ view[p].needsLookup === 1 ? 'needs' : 'need' }} looking up on {{ names[p] }} by ISRC.
+            <template v-if="view[p].lookupBudget !== null">
+              {{ names[p] }}'s quota is unpublished and a breach locks it for 13 to 18 hours, so one push spends at most {{ view[p].lookupBudget }} lookup requests
+              (1 ISRC each, or 5 if {{ names[p] }} search accepts OR). Songs not looked up stay staged for the next push.
+            </template>
           </p>
           <p v-if="waitingForCreate(p)" class="muted">{{ plural(waitingForCreate(p), 'song') }} in playlists {{ names[p] }} does not have yet will wait: creating playlists comes in a later step.</p>
           <div class="confirm-actions">

@@ -26,12 +26,12 @@ The plan is `docs/plan.md`; the reasons it changed along the way are in `docs/de
 
 ## Status
 
-Milestone **M4 Main and pull** is built and waiting to be checked against the real library, and **M5 Push** is under way: staging and push to Tidal are built. Crossfade writes to Tidal only when you press Push on the Staged page and confirm, and through the playlist cleanup on the Cleanup page. Nothing is written to Spotify yet.
+Milestone **M4 Main and pull** is built and waiting to be checked against the real library, and **M5 Push** is under way: staging and push to both services are built. Crossfade writes to a service only when you press Push on the Staged page and confirm, and to Tidal through the playlist cleanup on the Cleanup page.
 
 | | |
 | --- | --- |
 | Working | Login; connecting both services; pull per service (checkpointed, resumable, pauses on Spotify quota); main with conflicts and a sanity guard for bad reads; owned, collaborative and followed playlists; the Library diff showing what each service is missing; Activity log; Tidal duplicate and empty playlist cleanup |
-| Building: M5 Push | Done: staging per song, playlist or service; the Staged page that previews each push; push to Tidal (ISRC lookup, re-read before writing, per-song results, failures stay staged). Next: push to Spotify (rationed lookups), then creating playlists |
+| Building: M5 Push | Done: staging per song, playlist or service; the Staged page that previews each push; push to Tidal (ISRC lookup, re-read before writing, per-song results, failures stay staged). push to Spotify, with lookups rationed per push because of its quota. Next: creating playlists on the other service |
 | Then | M3 manual search and review; Docker and Unraid packaging; later, one-press sync and scheduled pulls |
 
 M4 is done when pulling Tidal then Spotify builds a main that matches the real libraries, the Library shows what each service is missing, and pulling again with nothing changed reports nothing new.

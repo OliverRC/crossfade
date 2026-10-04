@@ -5,6 +5,7 @@ import { and, eq, inArray } from 'drizzle-orm'
 import type { ProviderId, StagedTrackView, StagedView, TrackView } from '../../shared/types'
 import { PROVIDERS } from '../../shared/types'
 import { status, type Change } from '../core/status'
+import { spotifyLookupBudget } from './config'
 import { schema, useDb } from './db'
 import { collectionInputs } from './library'
 
@@ -108,6 +109,18 @@ export function stagedView(): StagedView {
         }
       })
       .sort((a, b) => Number(b.kind === 'liked') - Number(a.kind === 'liked') || a.name.localeCompare(b.name))
-    return [provider, { collections, add: mine.filter(c => c.change === 'add').length, remove: mine.filter(c => c.change === 'remove').length }]
+    const adds = mine.filter(c => c.change === 'add').map(c => c.canonicalTrackId)
+    const known = new Set(adds.length
+      ? db.select({ id: schema.trackLinks.canonicalTrackId }).from(schema.trackLinks)
+        .where(and(eq(schema.trackLinks.provider, provider), eq(schema.trackLinks.status, 'matched'), inArray(schema.trackLinks.canonicalTrackId, adds))).all()
+        .map(l => l.id)
+      : [])
+    return [provider, {
+      collections,
+      add: adds.length,
+      remove: mine.filter(c => c.change === 'remove').length,
+      needsLookup: new Set(adds.filter(id => !known.has(id))).size,
+      lookupBudget: provider === 'spotify' ? spotifyLookupBudget() : null,
+    }]
   })) as StagedView
 }

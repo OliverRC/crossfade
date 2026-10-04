@@ -1,6 +1,6 @@
 // The Library page: main compared with each service's last pull, per collection (docs/decisions/0005).
 import { and, desc, eq, inArray, isNull } from 'drizzle-orm'
-import type { CollectionStatusView, LibraryView, ProviderId, RunStatus, SnapshotItem, StatusCounts, StatusRowView } from '../../shared/types'
+import type { CollectionStatusView, LibraryView, ProviderId, RunStatus, SnapshotItem, TrackCopyView, StatusCounts, StatusRowView } from '../../shared/types'
 import { PROVIDERS } from '../../shared/types'
 import type { MainEntry } from '../core/pull'
 import { normaliseText } from '../core/normalise'
@@ -16,6 +16,22 @@ export interface CollectionInput {
   links: (typeof schema.collectionLinks.$inferSelect)[]
   holds: (typeof schema.pullHolds.$inferSelect)[]
   input: StatusInput
+}
+
+/** Per service, the copies (releases) it holds of each song in a collection, from its snapshot. */
+function heldCopies(collectionId: number): Record<ProviderId, Map<number, TrackCopyView[]>> {
+  const db = useDb()
+  const snaps = db.select().from(schema.snapshots).where(eq(schema.snapshots.collectionId, collectionId)).all()
+  const links = new Map(db.select().from(schema.trackLinks).all().map(l => [`${l.provider}:${l.providerTrackId}`, l]))
+  const out = { spotify: new Map(), tidal: new Map() } as Record<ProviderId, Map<number, TrackCopyView[]>>
+  for (const s of snaps) {
+    for (const i of s.items) {
+      const l = links.get(`${s.provider}:${i.providerTrackId}`)
+      const copy = { isrc: l?.isrc ?? null, title: l?.title ?? null, album: l?.album || null }
+      out[s.provider].set(i.canonicalTrackId, [...out[s.provider].get(i.canonicalTrackId) ?? [], copy])
+    }
+  }
+  return out
 }
 
 /** A service holding two releases of one song (docs/decisions/0008) offers it if it offers either. */
@@ -113,12 +129,18 @@ export function libraryView(selectedKey?: string): LibraryView {
       ? db.select().from(schema.canonicalTracks).where(inArray(schema.canonicalTracks.id, result.map(r => r.canonicalTrackId))).all().map(t => [t.id, t])
       : [])
     const conflictIds = new Map(openConflicts.filter(x => x.collectionId === Number(selected.key)).map(x => [x.canonicalTrackId, x.id]))
+    const copies = heldCopies(Number(selected.key))
     rows = result.map((r) => {
       const t = tracks.get(r.canonicalTrackId)
+      const held = { spotify: copies.spotify.get(r.canonicalTrackId) ?? [], tidal: copies.tidal.get(r.canonicalTrackId) ?? [] }
+      const shared = held.spotify.find(s => s.isrc && held.tidal.some(x => x.isrc === s.isrc))?.isrc
+      const pick = (p: ProviderId) => held[p].find(c => c.isrc === shared) ?? held[p][0]
       return {
         canonicalTrackId: r.canonicalTrackId,
         state: rowState(r),
         track: { title: t?.title || 'Unknown song', artists: t?.artists ?? [], durationMs: t?.durationMs ?? 0, isrc: t?.isrc ?? null },
+        copies: Object.fromEntries(PROVIDERS.filter(p => pick(p)).map(p => [p, pick(p)])),
+        matchedBy: held.spotify.length && held.tidal.length ? shared ? 'isrc' : 'metadata' : null,
         main: r.main,
         spotify: r.spotify,
         tidal: r.tidal,

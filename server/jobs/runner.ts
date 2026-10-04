@@ -5,14 +5,14 @@ import { EventEmitter } from 'node:events'
 import { and, desc, eq } from 'drizzle-orm'
 import type { ProviderId, RunProgress } from '../../shared/types'
 import { PROVIDERS } from '../../shared/types'
-import { requestCounts } from '../providers/http'
+import { QuotaError, requestCounts } from '../providers/http'
 import { schema, useDb } from '../utils/db'
-import { acquire, lockHolder, release } from './lock'
+import { acquire, lockHolder, onRelease, release } from './lock'
 import { runPull } from './pull'
 import { runPush } from './push'
 import type { PushWriter } from '../providers/types'
 import { pruneStaged } from '../utils/staging'
-import { providerNames } from './quota'
+import { providerNames, quotaBlockedUntil, quotaPause } from './quota'
 import { createRunLog, resetUnfinishedStages } from './run-log'
 
 /** An unfinished pull older than this is abandoned and a fresh one starts. */
@@ -62,9 +62,43 @@ export function restoreSchedule() {
   }
 }
 
+/** Pulls waiting for the running job. In memory: a restart drops the queue, never a pull already started. */
+const queue: ProviderId[] = []
+
+/**
+ * Pull a service now, or after the running job when one is running. Returns the run ID when it started, 'queued' when
+ * it waits, or null when that service is already pulling.
+ */
+export function pullOrQueue(provider: ProviderId): number | 'queued' | null {
+  if (queue.includes(provider)) return 'queued'
+  if (progress.running && progress.provider === provider && progress.phase !== 'push') return null
+  const runId = progress.running || lockHolder() ? null : startPull(provider, 'manual')
+  if (runId !== null) return runId
+  queue.push(provider)
+  update({ queued: [...queue] })
+  return 'queued'
+}
+
+/** Take a service out of the queue. */
+export function unqueuePull(provider: ProviderId) {
+  const i = queue.indexOf(provider)
+  if (i >= 0) queue.splice(i, 1)
+  update({ queued: [...queue] })
+}
+
+// When a job lets go of the lock, the next queued pull starts. Deferred so the finished job settles first.
+onRelease(() => setTimeout(() => {
+  const next = queue[0]
+  if (!next || progress.running || lockHolder()) return
+  queue.shift()
+  update({ queued: [...queue] })
+  if (startPull(next, 'manual') === null) { queue.unshift(next); update({ queued: [...queue] }) }
+}, 0))
+
 /** Start or resume a pull of one service unless a job is running. Returns the run ID, or null when skipped. */
 export function startPull(provider: ProviderId, trigger: 'manual' | 'schedule' = 'manual'): number | null {
   if (progress.running || !acquire('pull')) return null
+  unqueuePull(provider)
   const timer = timers.get(provider)
   if (timer) { clearTimeout(timer); timers.delete(provider) }
   const db = useDb()
@@ -146,12 +180,14 @@ export function startPush(provider: ProviderId, writer: PushWriter): number | nu
         log.flush()
         const requests = { [`${provider}Requests`]: requestCounts[provider] - start }
         db.update(schema.syncRuns).set({ status: 'succeeded', finishedAt: new Date().toISOString(), counts: { ...counts, ...requests } }).where(eq(schema.syncRuns.id, run.id)).run()
-        const summary = `${counts.added} added, ${counts.removed} removed${counts.failed ? `, ${counts.failed} failed and still staged` : ''}${counts.skipped ? `, ${counts.skipped} waiting for playlist creation` : ''}`
+        const summary = `${counts.added} added, ${counts.removed} removed${counts.failed ? `, ${counts.failed} failed and still staged` : ''}${counts.deferred ? `, ${counts.deferred} not looked up yet (lookup budget spent; push again)` : ''}${counts.skipped ? `, ${counts.skipped} waiting for playlist creation` : ''}`
         log.event(counts.failed ? 'warn' : 'info', null, `Finished: ${summary} on ${name}`)
         update({ running: false, phase: 'done', message: `Pushed to ${name}: ${summary}.` })
       })
       .catch((error: Error) => {
         console.error('[push] failed', error)
+        // Record the cooldown so nothing is sent to the service before it clears (the push job may have already).
+        if (error instanceof QuotaError) quotaPause(provider, error)
         const stage = log.current()
         if (stage) log.stage(stage, { status: 'failed', detail: error.message })
         log.event('error', stage, `Stopped: ${error.message}. What was written is recorded; the rest stays staged, and pushing again re-reads each playlist first`)
@@ -162,7 +198,11 @@ export function startPush(provider: ProviderId, writer: PushWriter): number | nu
         for (const c of Object.values(push?.collections ?? {})) {
           for (const s of [c.add, c.remove]) if (s && (s.status === 'running' || s.status === 'waiting')) Object.assign(s, { status: 'failed', detail: s.status === 'running' ? error.message : 'Not attempted: the push stopped' })
         }
-        update({ running: false, phase: 'failed', message: `The push to ${name} stopped: ${error.message}`, error: error.message, push })
+        const blocked = error instanceof QuotaError ? quotaBlockedUntil(provider) : null
+        const message = blocked
+          ? `The push to ${name} stopped: ${name}'s quota is used up until ${blocked.slice(11, 16)} UTC${blocked.slice(0, 10) === new Date().toISOString().slice(0, 10) ? '' : ` on ${blocked.slice(0, 10)}`}. What was written is recorded and the rest stays staged`
+          : `The push to ${name} stopped: ${error.message}`
+        update({ running: false, phase: 'failed', message, error: error.message, push })
       })
       .finally(() => release('push'))
     return run.id

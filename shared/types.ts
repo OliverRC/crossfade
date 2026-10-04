@@ -58,10 +58,21 @@ export interface StatusCounts {
   addUnavailable: Record<ProviderId, number>
 }
 
+/** The copy of a song one service holds in a collection: a release with its own ISRC (docs/decisions/0008). */
+export interface TrackCopyView {
+  isrc: string | null
+  title: string | null
+  album: string | null
+}
+
 export interface StatusRowView {
   canonicalTrackId: number
   state: RowState
   track: TrackView
+  /** The copy each service holds in this collection, where it holds one. */
+  copies: Partial<Record<ProviderId, TrackCopyView>>
+  /** How the two services' copies are one song: the same ISRC, or equal title, artists and length with different ISRCs. */
+  matchedBy: 'isrc' | 'metadata' | null
   main: 'active' | 'removed'
   spotify: SideState
   tidal: SideState
@@ -135,7 +146,15 @@ export interface StagedTrackView extends TrackView {
 }
 
 /** What the next push to each service would do (docs/decisions/0007). */
-export type StagedView = Record<ProviderId, { collections: StagedCollectionView[], add: number, remove: number }>
+export type StagedView = Record<ProviderId, {
+  collections: StagedCollectionView[]
+  add: number
+  remove: number
+  /** Staged adds with no known ID on the service: push looks them up by ISRC. */
+  needsLookup: number
+  /** Lookup requests one push may spend on this service; null for no limit. */
+  lookupBudget: number | null
+}>
 
 export interface QuotaView {
   /** True while requests are held back; false once the retry time has passed. */
@@ -264,6 +283,8 @@ export interface RunProgress {
   rev: number
   /** The push in progress or last finished, step by step per collection; null for a pull. */
   push?: PushProgress | null
+  /** Pulls waiting for the running job to finish, in the order they start. */
+  queued?: ProviderId[]
 }
 
 export type PushStepStatus = 'waiting' | 'running' | 'done' | 'failed' | 'skipped'

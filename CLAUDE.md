@@ -5,7 +5,7 @@ Self-hosted two-way sync of one person's Spotify and Tidal libraries (liked song
 ## Status
 
 - Current milestone: **M4 Main and pull** (`docs/decisions/0005`). Done when pulling Tidal then Spotify builds a main Oliver agrees with, the Library page shows what each service is missing, and pulling again with nothing changed reports nothing new. V0 is done; its dry-run sync was replaced by pull.
-- In progress: M5 (push), in slices (`docs/decisions/0007`): staging and push to Tidal are built (push sends only staged changes; new changes start unstaged); Oliver's first real Tidal push is to go to a test playlist. Push to Spotify is next, then creating playlists. M3 (manual search and review) follows M5. A one-press sync (pull both, push both) waits until pull and push are trusted. Docker and Unraid packaging can slot in whenever he wants it deployed.
+- In progress: M5 (push), in slices (`docs/decisions/0007`): staging and push to both services are built (push sends only staged changes; new changes start unstaged; Spotify lookups are capped per push by `SPOTIFY_LOOKUPS_PER_RUN`). Oliver's first real pushes are to go to a test playlist. Creating playlists on the other service is next. M3 (manual search and review) follows M5. A one-press sync (pull both, push both) waits until pull and push are trusted. Docker and Unraid packaging can slot in whenever he wants it deployed.
 - Pulls are checkpointed and resumable, and pause on quota (`docs/decisions/0003`). Spotify's Development Mode quota is unpublished, with reported cooldowns of 13 to 18 hours: never retry `QUOTA_EXCEEDED`, and keep Spotify lookups rationed (they belong to push).
 - Work one milestone at a time. Stop at each milestone's "Done when" for Oliver to verify.
 
@@ -50,7 +50,7 @@ Spotify:
 - Create playlist: `POST /me/playlists`. Search `limit` max 10.
 - `external_ids` (ISRC) was removed in Feb 2026 and restored in March 2026.
 - No batch ISRC lookup (Get Several Tracks is gone). Search with `OR` between `isrc:` filters is undocumented; `server/providers/spotify-isrc.ts` detects whether it works and falls back to one ISRC per request.
-- Development Mode quota: unpublished, shared across the developer account; `429` with `reason: QUOTA_EXCEEDED`, reported cooldowns of 13 to 18 hours.
+- Development Mode quota: unpublished, shared across the developer account; `429` with `reason: QUOTA_EXCEEDED`, reported cooldowns of 13 to 18 hours. Observed 2026-10-03: `Retry-After: 84469` (about 23.5 hours).
 
 Tidal (`https://openapi.tidal.com/v2`, JSON:API, `application/vnd.api+json`):
 - Liked tracks: `/userCollectionTracks/me/relationships/items` (GET, POST, DELETE; body `{ data: [{ type: 'tracks', id }] }`, max 50 per write).

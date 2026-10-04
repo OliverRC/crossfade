@@ -24,6 +24,10 @@ export const trackLinks = sqliteTable('track_links', {
   provider: text('provider').$type<ProviderId>().notNull(),
   /** Null while unmatched or under review. */
   providerTrackId: text('provider_track_id'),
+  /** This copy as the service has it: one song can be several releases with their own ISRC (docs/decisions/0008). */
+  isrc: text('isrc'),
+  title: text('title'),
+  album: text('album'),
   status: text('status').$type<LinkStatus>().notNull(),
   method: text('method').$type<LinkMethod>(),
   confidence: real('confidence'),

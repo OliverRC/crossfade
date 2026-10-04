@@ -3,7 +3,7 @@ import type { ProviderTrack } from '../shared/types'
 import { normaliseText, splitTitle, versionKind } from '../server/core/normalise'
 import { REVIEW_FLOOR, durationScore, pickIsrcResult, scoreMatch } from '../server/core/score'
 import { isoDurationToMs } from '../server/core/duration'
-import { type MatchSong, type MetadataMerge, metadataKey, metadataMerges } from '../server/core/match'
+import { type MatchSong, type MetadataMerge, cleanArtist, metadataMerges } from '../server/core/match'
 
 const track = (over: Partial<ProviderTrack>): ProviderTrack => ({
   providerTrackId: 'x', isrc: null, title: 'Song', artists: ['Artist'], album: 'Album',
@@ -117,6 +117,9 @@ describe('metadata matching (decision 0008)', () => {
     { name: 'different artists', songs: [song(1, ['spotify']), song(2, ['tidal'], { artists: ['Someone Else'] })], merges: [] },
     { name: 'two copies only one service holds stay apart', songs: [song(1, ['tidal']), song(2, ['tidal'])], merges: [] },
     { name: 'two copies on one service matching one on the other is ambiguous', songs: [song(1, ['spotify']), song(2, ['tidal']), song(3, ['tidal'])], merges: [] },
+    { name: 'an artist credited on one service and named only in the title on the other', songs: [song(1, ['spotify'], { title: 'Mine - Bazzi vs. Eden Prince Remix', artists: ['Bazzi vs.', 'Eden Prince'] }), song(2, ['tidal'], { title: 'Mine (Bazzi vs. Eden Prince Remix)', artists: ['Bazzi'] })], merges: [{ keep: 1, merge: [2] }] },
+    { name: 'an extra artist the other title does not name', songs: [song(1, ['spotify'], { artists: ['Gavin James', 'Someone Else'] }), song(2, ['tidal'])], merges: [] },
+    { name: 'no artist in common, even if named in the title', songs: [song(1, ['spotify'], { title: 'Always (Eden Prince Remix)', artists: ['Eden Prince'] }), song(2, ['tidal'], { title: 'Always (Eden Prince Remix)', artists: ['Gavin James'] })], merges: [] },
     { name: 'songs with no title never match', songs: [song(1, ['spotify'], { title: '' }), song(2, ['tidal'], { title: '' })], merges: [] },
     { name: 'lengths do not drift along a chain', songs: [song(1, ['spotify']), song(2, ['tidal'], { durationMs: 201_500 }), song(3, ['tidal'], { durationMs: 203_000 })], merges: [{ keep: 1, merge: [2] }] },
   ]
@@ -124,7 +127,13 @@ describe('metadata matching (decision 0008)', () => {
     expect(metadataMerges(songs)).toEqual(merges)
   })
 
-  it('a key ignores artist order', () => {
-    expect(metadataKey('Song', null, ['B', 'A'])).toBe(metadataKey('Song', null, ['a', 'b']))
+  it('artist order does not matter', () => {
+    expect(metadataMerges([song(1, ['spotify'], { artists: ['B', 'A'] }), song(2, ['tidal'], { artists: ['a', 'b'] })])).toEqual([{ keep: 1, merge: [2] }])
+  })
+
+  it('cleans joining words off artist names', () => {
+    expect(cleanArtist('Bazzi vs.')).toBe('bazzi')
+    expect(cleanArtist('Jay-Z &')).toBe('jay z')
+    expect(cleanArtist('Max')).toBe('max')
   })
 })

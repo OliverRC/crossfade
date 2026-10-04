@@ -165,6 +165,8 @@ describe('pull into main', () => {
       await pullOf('spotify')
       await pullOf('tidal')
       expect(rowsOf('Alt Tunes').map(r => r.state)).toEqual(['in_sync'])
+      // Each side shows its own release, and the row says the ISRCs differ.
+      expect(rowsOf('Alt Tunes')[0]).toMatchObject({ matchedBy: 'metadata', copies: { spotify: { isrc: 'SINGLE', album: 'Always' }, tidal: { isrc: 'ALBUM', album: 'Form & Function' } } })
       expect(db.select().from(schema.canonicalTracks).all()).toHaveLength(1)
       expect(db.select().from(schema.trackLinks).all().map(l => `${l.providerTrackId}:${l.method}`).sort()).toEqual(['s-single:origin', 't-album:metadata'])
       const again = await pullOf('tidal')
@@ -180,6 +182,7 @@ describe('pull into main', () => {
       await pullOf('spotify')
       expect(rowsOf('Alt Tunes').map(r => r.state)).toEqual(['in_sync'])
       expect(rowsOf('Liked songs').map(r => r.state)).toEqual(['in_sync'])
+      expect(rowsOf('Liked songs')[0]!.matchedBy).toBe('metadata')
       expect(libraryView().totals.add).toEqual({ spotify: 0, tidal: 0 })
       expect((await pullOf('tidal')).counts).toMatchObject({ added: 0, removed: 0, confirmed: 0, conflicts: 0 })
     })
@@ -327,7 +330,7 @@ describe('pull into main', () => {
 
       const view = staging.stagedView()
       expect(view.tidal).toMatchObject({ add: 1, remove: 0, collections: [{ name: 'Liked songs', createsPlaylist: false, add: [{ isrc: 'ISRC1' }], remove: [] }] })
-      expect(view.spotify).toEqual({ collections: [], add: 0, remove: 0 })
+      expect(view.spotify).toEqual({ collections: [], add: 0, remove: 0, needsLookup: 0, lookupBudget: 150 })
     })
 
     it('stages a collection or a service in bulk, and unstages it again', async () => {
@@ -390,12 +393,23 @@ describe('pull into main', () => {
     let writes: string[] = []
     const quietLog: RunLog = { stage: () => {}, event: () => {}, current: () => null, flush: () => {} }
 
-    function fakeWriter(): PushWriter {
-      const lib = libraries.tidal
-      const byId = (id: string) => T(Number(id.slice(1)))
+    /** Lookup requests made, and the ISRC batch on which the fake service answers QUOTA_EXCEEDED. */
+    let lookups: string[][] = []
+    let quotaOnLookup: number | null = null
+
+    function fakeWriter(provider: ProviderId = 'tidal', opts: { budget?: number | null, batch?: number } = {}): PushWriter {
+      const lib = libraries[provider]
+      const prefix = provider === 'tidal' ? 't' : 's'
+      const byId = (id: string) => (provider === 'tidal' ? T : S)(Number(id.slice(1)))
       return {
-        id: 'tidal',
-        findPlayableByIsrcs: async isrcs => new Map(isrcs.filter(i => !missingOnTidal.has(i)).map(i => [i, `t${i.replace('ISRC', '')}`])),
+        id: provider,
+        isrcBatchSize: opts.batch ?? 20,
+        lookupBudget: opts.budget ?? null,
+        findPlayableByIsrcs: async (isrcs) => {
+          lookups.push(isrcs)
+          if (quotaOnLookup === lookups.length) throw new QuotaError(provider, `${provider} GET /search → 429 QUOTA_EXCEEDED`, null)
+          return { found: new Map(isrcs.filter(i => !missingOnTidal.has(i)).map(i => [i, `${prefix}${i.replace('ISRC', '')}`])), requests: 1 }
+        },
         readPlaylist: async (pid) => {
           const p = lib.playlists[pid]
           return p ? p.tracks.map((t, n): PlaylistEntry => ({ trackId: t.providerTrackId, entryId: `${pid}-${n}`, isrc: t.isrc })) : null
@@ -426,7 +440,7 @@ describe('pull into main', () => {
     }
     const push = () => runPush('tidal', fakeWriter(), () => {}, quietLog)
 
-    beforeEach(() => { missingOnTidal = new Set(); refused = new Set(); writes = [] })
+    beforeEach(() => { missingOnTidal = new Set(); refused = new Set(); writes = []; lookups = []; quotaOnLookup = null })
 
     it('writes only what is staged, then status, the stage and the next pull all agree', async () => {
       await pullOf('spotify')
@@ -435,7 +449,7 @@ describe('pull into main', () => {
       // Staged for Spotify too, but a Tidal push leaves it alone.
       staging.setStaged({ provider: 'spotify', collectionId: key('Liked songs') }, true)
 
-      expect(await push()).toEqual({ added: 2, removed: 0, failed: 0, skipped: 0 })
+      expect(await push()).toEqual({ added: 2, removed: 0, failed: 0, skipped: 0, deferred: 0 })
       expect(writes).toEqual(['like t1', 'add tp1 t2'])
       expect(libraries.tidal.liked.map(t => t.isrc)).toContain('ISRC1')
       expect(libraries.tidal.playlists.tp1!.tracks.map(t => t.isrc)).toEqual(['ISRC1', 'ISRC2'])
@@ -521,6 +535,50 @@ describe('pull into main', () => {
       delete libraries.tidal.playlists.tp1
       expect(await push()).toMatchObject({ failed: 1 })
       expect(db.select().from(schema.stagedChanges).all()[0]!.lastError).toMatch(/no longer on Tidal/)
+    })
+    describe('to Spotify (slice 3)', () => {
+      /** Spotify liked 1–3 and Night Drive 1, 2; Tidal adds songs 10–17 to its liked songs, none known to Spotify. */
+      async function setUp() {
+        libraries.tidal.liked = [T(2), T(3), T(4), ...range(10, 17).map(T)]
+        await pullOf('spotify')
+        await pullOf('tidal')
+        staging.setStaged({ provider: 'spotify' }, true)
+      }
+
+      it('pushes adds to Spotify liked songs, looking songs up by ISRC', async () => {
+        await setUp()
+        const counts = await runPush('spotify', fakeWriter('spotify', { batch: 5 }), () => {}, quietLog)
+        expect(counts).toMatchObject({ added: 9, failed: 0, deferred: 0 })
+        // Song 4 and 10–17 are looked up 5 at a time; Gym is not on Spotify, so song 5 waits for playlist creation.
+        expect(lookups.flat().sort()).toEqual(['ISRC10', 'ISRC11', 'ISRC12', 'ISRC13', 'ISRC14', 'ISRC15', 'ISRC16', 'ISRC17', 'ISRC4'].sort())
+        expect(counts.skipped).toBe(1)
+        expect(libraries.spotify.liked.map(t => t.providerTrackId)).toEqual(expect.arrayContaining(['s4', 's10', 's17']))
+        expect((await pullOf('spotify')).counts).toMatchObject({ added: 0, removed: 0, conflicts: 0 })
+      })
+
+      it('stops looking up at the budget; the rest stay staged without an error, and the next push carries on', async () => {
+        await setUp()
+        const first = await runPush('spotify', fakeWriter('spotify', { batch: 5, budget: 1 }), () => {}, quietLog)
+        expect(lookups).toHaveLength(1)
+        expect(first).toMatchObject({ added: 5, failed: 0, deferred: 4 })
+        const left = db.select().from(schema.stagedChanges).all().filter(r => r.provider === 'spotify' && r.change === 'add')
+        expect(left.filter(r => r.lastError)).toEqual([])
+
+        lookups = []
+        const second = await runPush('spotify', fakeWriter('spotify', { batch: 5, budget: 1 }), () => {}, quietLog)
+        expect(second).toMatchObject({ added: 4, deferred: 0 })
+      })
+
+      it('stops on QUOTA_EXCEEDED without writing, keeps what it found, and records the cooldown', async () => {
+        await setUp()
+        quotaOnLookup = 2
+        await expect(runPush('spotify', fakeWriter('spotify', { batch: 5 }), () => {}, quietLog)).rejects.toBeInstanceOf(QuotaError)
+        expect(writes).toEqual([])
+        // The first batch's five songs are linked, so the next push will not look them up again.
+        expect(db.select().from(schema.trackLinks).all().filter(l => l.provider === 'spotify' && l.method === 'isrc')).toHaveLength(5)
+        expect(db.select().from(schema.providerAccounts).all().find(a => a.provider === 'spotify')!.quotaBlockedUntil).not.toBeNull()
+        db.update(schema.providerAccounts).set({ quotaBlockedUntil: null }).run()
+      })
     })
   })
 })

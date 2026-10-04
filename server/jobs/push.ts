@@ -1,7 +1,8 @@
 // Push the changes staged for one service (docs/decisions/0007). The only code path that writes to a real library,
 // apart from the Tidal playlist cleanup. Main is not changed: a push makes the service match main.
 //
-// 1. Find each song to add on the service: an earlier link, else by ISRC (recorded as a link).
+// 1. Find each song to add on the service: an earlier link, else by ISRC (recorded as a link). Lookups stop at the
+//    writer's budget (Spotify's quota is unpublished); songs not looked up stay staged for the next push.
 // 2. Per collection, read the playlist again and write only what it still needs. Liked songs are not re-read
 //    (thousands of songs, 20 per page); their writes are idempotent instead.
 // 3. Per song: a success updates the service's snapshot (so status shows it in sync and the staged pick leaves);
@@ -9,10 +10,11 @@
 import { and, eq, inArray } from 'drizzle-orm'
 import type { ProviderId, PushProgress, PushStepProgress, SnapshotItem } from '../../shared/types'
 import type { Change } from '../core/status'
+import { QuotaError } from '../providers/http'
 import type { PlaylistEntry, PushWriter, WriteFailures } from '../providers/types'
 import { schema, useDb } from '../utils/db'
 import { stagedChanges } from '../utils/staging'
-import { providerNames } from './quota'
+import { providerNames, quotaPause } from './quota'
 import type { RunLog } from './run-log'
 
 export interface PushCounts {
@@ -20,9 +22,11 @@ export interface PushCounts {
   removed: number
   failed: number
   skipped: number
+  /** Songs not looked up: the lookup budget for this push was spent. They stay staged, without an error. */
+  deferred: number
 }
 
-interface Item { canonicalTrackId: number, change: Change, isrc: string | null, title: string, trackId: string | null, error: string | null }
+interface Item { canonicalTrackId: number, change: Change, isrc: string | null, title: string, trackId: string | null, error: string | null, deferred?: boolean }
 interface Group { collectionId: number, key: string, name: string, kind: 'liked' | 'playlist', playlistId: string | null, items: Item[] }
 
 const now = () => new Date().toISOString()
@@ -38,7 +42,7 @@ export async function runPush(
   log: RunLog,
 ): Promise<PushCounts> {
   const name = providerNames[provider]
-  const counts: PushCounts = { added: 0, removed: 0, failed: 0, skipped: 0 }
+  const counts: PushCounts = { added: 0, removed: 0, failed: 0, skipped: 0, deferred: 0 }
   const groups = loadGroups(provider)
   const total = groups.reduce((n, g) => n + g.items.length, 0)
   if (!total) {
@@ -62,9 +66,23 @@ export async function runPush(
   // 1. Find songs to add on the service.
   const adds = groups.filter(g => g.playlistId || g.kind === 'liked').flatMap(g => g.items.filter(i => i.change === 'add'))
   log.stage('lookup', { status: 'running', done: 0, total: adds.length, detail: null })
-  await resolveTrackIds(provider, writer, adds)
-  const unresolved = adds.filter(i => !i.trackId).length
-  log.stage('lookup', { status: 'done', done: adds.length, detail: unresolved ? `${count(adds.length - unresolved, 'song')} found, ${unresolved} not on ${name}` : `${count(adds.length, 'song')} found` })
+  const lookup = await resolveTrackIds(provider, writer, adds)
+  const notFound = adds.filter(i => i.error).length
+  counts.deferred = adds.filter(i => i.deferred).length
+  const lookupDetail = [
+    `${count(adds.filter(i => i.trackId).length, 'song')} found`,
+    notFound ? `${notFound} not on ${name}` : null,
+    counts.deferred ? `${counts.deferred} not looked up yet` : null,
+    lookup.requests ? count(lookup.requests, 'lookup request') : null,
+  ].filter(Boolean).join(', ')
+  if (lookup.quota) {
+    // Every request counts against the quota, writes too: stop here. Songs found so far are saved as links.
+    const pause = quotaPause(provider, lookup.quota)
+    log.stage('lookup', { status: 'failed', done: adds.length, detail: `${lookupDetail}; ${pause.message}` })
+    throw lookup.quota
+  }
+  log.stage('lookup', { status: 'done', done: adds.length, detail: lookupDetail })
+  if (counts.deferred) log.event('info', 'lookup', `Lookup budget spent (${lookup.requests} requests): ${count(counts.deferred, 'song')} stay staged for the next push`)
 
   // 2. Write, one collection at a time.
   log.stage('write', { status: 'running', done: 0, total, detail: null })
@@ -111,7 +129,9 @@ export async function runPush(
         ? await writeAdds(writer, g, items, entries)
         : await writeRemoves(provider, writer, g, items, entries)
       const failed = items.filter(i => i.error).length
-      Object.assign(step, { status: failed === items.length ? 'failed' : 'done', done: ok.length, failed, detail: failed ? firstError(items) : null })
+      const deferred = items.filter(i => i.deferred).length
+      const detail = failed ? firstError(items) : deferred ? `${count(deferred, 'song')} not looked up yet: this push's ${name} lookups are spent; push again to continue` : null
+      Object.assign(step, { status: failed && failed === items.length ? 'failed' : 'done', done: ok.length, failed, detail })
       settle(provider, g, ok, items.filter(i => i.error))
       if (change === 'add') counts.added += ok.length
       else counts.removed += ok.length
@@ -153,9 +173,13 @@ function loadGroups(provider: ProviderId): Group[] {
   }).sort((a, b) => Number(b.kind === 'liked') - Number(a.kind === 'liked') || a.name.localeCompare(b.name))
 }
 
-/** The service's track for each song to add: its preferred link, else an ISRC lookup, saved as a new link. */
-async function resolveTrackIds(provider: ProviderId, writer: PushWriter, items: Item[]) {
-  if (!items.length) return
+/**
+ * The service's track for each song to add: its preferred link, else an ISRC lookup, saved as a new link as each
+ * batch returns. Lookups stop at the writer's budget, leaving the rest deferred, or at a quota error, which is
+ * returned rather than thrown so the caller can record it.
+ */
+async function resolveTrackIds(provider: ProviderId, writer: PushWriter, items: Item[]): Promise<{ requests: number, quota: QuotaError | null }> {
+  if (!items.length) return { requests: 0, quota: null }
   const db = useDb()
   const ids = [...new Set(items.map(i => i.canonicalTrackId))]
   const links = db.select().from(schema.trackLinks)
@@ -166,28 +190,44 @@ async function resolveTrackIds(provider: ProviderId, writer: PushWriter, items: 
     if (!linked.has(l.canonicalTrackId)) linked.set(l.canonicalTrackId, l.providerTrackId!)
   }
 
-  const lookup = [...new Set(items.filter(i => !linked.has(i.canonicalTrackId) && i.isrc).map(i => i.isrc!))]
-  const found = lookup.length ? await writer.findPlayableByIsrcs(lookup) : new Map<string, string>()
-  db.transaction((tx) => {
-    for (const id of ids) {
-      if (linked.has(id)) continue
-      const isrc = items.find(i => i.canonicalTrackId === id)!.isrc
-      const trackId = isrc ? found.get(isrc) : undefined
-      if (!trackId) continue
-      // Another canonical song may already own this track ID (unique per service); reuse rather than collide.
-      const owner = tx.select().from(schema.trackLinks).where(and(eq(schema.trackLinks.provider, provider), eq(schema.trackLinks.providerTrackId, trackId))).get()
-      if (!owner) {
-        tx.insert(schema.trackLinks).values({ canonicalTrackId: id, provider, providerTrackId: trackId, status: 'matched', method: 'isrc', confidence: 1, isPreferred: true, lastCheckedAt: now() }).run()
-      }
-      linked.set(id, trackId)
+  const queue = [...new Set(items.filter(i => !linked.has(i.canonicalTrackId) && i.isrc).map(i => i.isrc!))]
+  const looked = new Set<string>()
+  let requests = 0
+  let quota: QuotaError | null = null
+  while (queue.length) {
+    if (writer.lookupBudget !== null && requests >= writer.lookupBudget) break
+    const batch = queue.splice(0, writer.isrcBatchSize)
+    let result: Awaited<ReturnType<PushWriter['findPlayableByIsrcs']>>
+    try {
+      result = await writer.findPlayableByIsrcs(batch)
+    } catch (error) {
+      if (error instanceof QuotaError) { quota = error; break }
+      throw error
     }
-  })
+    requests += result.requests
+    for (const isrc of batch) looked.add(isrc)
+    db.transaction((tx) => {
+      for (const i of items) {
+        const trackId = i.isrc && batch.includes(i.isrc) ? result.found.get(i.isrc) : undefined
+        if (!trackId || linked.has(i.canonicalTrackId)) continue
+        // Another canonical song may already own this track ID (unique per service); reuse rather than collide.
+        const owner = tx.select().from(schema.trackLinks).where(and(eq(schema.trackLinks.provider, provider), eq(schema.trackLinks.providerTrackId, trackId))).get()
+        if (!owner) {
+          tx.insert(schema.trackLinks).values({ canonicalTrackId: i.canonicalTrackId, provider, providerTrackId: trackId, status: 'matched', method: 'isrc', confidence: 1, isPreferred: true, lastCheckedAt: now() }).run()
+        }
+        linked.set(i.canonicalTrackId, trackId)
+      }
+    })
+  }
 
   const name = providerNames[provider]
   for (const i of items) {
     i.trackId = linked.get(i.canonicalTrackId) ?? null
-    if (!i.trackId) i.error = i.isrc ? `Not found on ${name} by ISRC ${i.isrc}` : `No ISRC, so it cannot be found on ${name} automatically yet`
+    if (i.trackId) continue
+    if (i.isrc && !looked.has(i.isrc)) i.deferred = true
+    else i.error = i.isrc ? `Not found on ${name} by ISRC ${i.isrc}` : `No ISRC, so it cannot be found on ${name} automatically yet`
   }
+  return { requests, quota }
 }
 
 /** Add what the collection still lacks. Returns the songs now there. */

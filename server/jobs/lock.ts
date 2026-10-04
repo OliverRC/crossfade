@@ -2,6 +2,10 @@
 export type Job = 'pull' | 'push' | 'cleanup'
 
 let holder: Job | null = null
+const released: (() => void)[] = []
+
+/** Run `listener` whenever a job lets go of the lock. */
+export const onRelease = (listener: () => void) => { released.push(listener) }
 
 export const lockHolder = () => holder
 
@@ -12,5 +16,7 @@ export function acquire(job: Job): boolean {
 }
 
 export function release(job: Job) {
-  if (holder === job) holder = null
+  if (holder !== job) return
+  holder = null
+  for (const listener of released) listener()
 }

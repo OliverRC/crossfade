@@ -10,7 +10,8 @@ Oliver's call: matching starts on ISRC and falls back to metadata.
 
 Two songs are one song when all of these hold:
 
-- The cleaned-up title base, artists and version are equal. Cleaning lowercases, strips accents and punctuation, turns `&` into `and`, moves "feat." artists into the artist list, and splits version tags ("Remastered", "Live", "Radio Edit") from the title. Tidal's separate version field counts as part of the title.
+- The cleaned-up title base and version are equal. Cleaning lowercases, strips accents and punctuation, turns `&` into `and`, moves "feat." artists into the artist list, and splits version tags ("Remastered", "Live", "Radio Edit") from the title. Tidal's separate version field counts as part of the title.
+- The artists agree: the same names once joining words a service leaves on a name are dropped (Spotify credits an artist called "Bazzi vs."), or one service credits an artist the other names only in the title (Tidal's "Mine (Bazzi vs. Eden Prince Remix)" by Bazzi). At least one artist must be credited on both.
 - Their lengths are within 2 seconds.
 - Between them they are on both services. Two copies that only one service holds never merge: a service keeping two copies apart (a demo and a re-recording, clean and explicit) usually means they differ.
 - The match is unambiguous: if one service has two candidate copies, neither joins.

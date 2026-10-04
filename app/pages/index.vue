@@ -98,6 +98,9 @@ async function act(request: () => Promise<unknown>) {
 }
 const post = (url: string, body?: Record<string, unknown>) => act(() => $fetch<unknown>(url, { method: 'POST', body }))
 const pull = (p: ProviderId) => post(`/api/pull/${p}`)
+/** A pull asked for while another job runs waits its turn, and can be taken out again. */
+const queued = (p: ProviderId) => progress.value?.queued?.includes(p) ?? false
+const unqueue = (p: ProviderId) => act(() => $fetch<unknown>(`/api/pull/${p}`, { method: 'DELETE' }))
 const decideConflict = (row: StatusRowView, resolution: 'keep' | 'remove') => post(`/api/conflicts/${row.conflict!.id}`, { resolution })
 const decideHold = (h: HoldView, action: 'accept' | 'keep' | 'remove') => post(`/api/holds/${h.id}`, { action })
 
@@ -116,6 +119,10 @@ function holdText(h: HoldView): string {
 }
 
 /** What one service holds for a row, when it holds nothing worth showing a track for. */
+const matchHelp = {
+  isrc: 'Both services hold a copy with the same ISRC.',
+  metadata: 'The services hold copies with different ISRCs (different releases); they are one song because title, artists, version and length (within 2 seconds) are equal.',
+}
 const gapLabel: Partial<Record<SideState, string>> = { missing: 'Not here yet', absent: 'Removed', unknown: 'Not pulled yet', followed: 'Followed: cannot read' }
 const showsTrack = (s: SideState) => s === 'present' || s === 'unavailable' || s === 'extra'
 
@@ -246,12 +253,16 @@ const mainMark = (row: StatusRowView): Mark => row.main === 'active'
             <div class="mono service-meta">
               <template v-if="pulling(p)">{{ progress?.message }}<span v-if="progress?.total"> · {{ progress.done }}/{{ progress.total }}</span></template>
               <template v-else-if="pushingTo(p)">Pushing staged changes…</template>
+              <template v-else-if="queued(p)">pull queued · starts when the current job finishes</template>
               <template v-else-if="library?.services[p].pulledAt">pulled {{ formatWhen(library.services[p].pulledAt!) }} · {{ plural(waiting(library.totals)[p], 'change') }} to push<template v-if="stagedCount(library.totals)[p]">, {{ stagedCount(library.totals)[p].toLocaleString('en-GB') }} staged</template></template>
               <template v-else>never pulled</template>
             </div>
           </div>
-          <button type="button" class="pill small solid-black" :disabled="running || !connected(p)" :title="connected(p) ? '' : `Connect ${names[p]} first`" @click="pull(p)">
-            {{ pulling(p) ? 'Pulling' : library?.services[p].run && library.services[p].run!.status !== 'succeeded' ? `Resume ${names[p]}` : `Pull ${names[p]}` }}
+          <button v-if="queued(p)" type="button" class="pill small outline-dark" title="Take this pull out of the queue" @click="unqueue(p)">
+            Queued · cancel
+          </button>
+          <button v-else type="button" class="pill small solid-black" :disabled="pulling(p) || !connected(p)" :title="connected(p) ? running ? `Pull ${names[p]} when the current job finishes` : '' : `Connect ${names[p]} first`" @click="pull(p)">
+            {{ pulling(p) ? 'Pulling' : running ? `Queue ${names[p]}` : library?.services[p].run && library.services[p].run!.status !== 'succeeded' ? `Resume ${names[p]}` : `Pull ${names[p]}` }}
           </button>
         </div>
         <EqualizerDots class="main-eq" :values="library?.recent ?? []" :columns="20" :animate="running" />
@@ -335,10 +346,10 @@ const mainMark = (row: StatusRowView): Mark => row.main === 'active'
         <div v-for="row in rows" :key="row.canonicalTrackId" class="row" :class="row.state">
           <div v-for="p in PROVIDERS" :key="p" class="cell" :style="{ order: p === 'spotify' ? 1 : 3 }">
             <template v-if="showsTrack(row[p])">
-              <div class="track-title" :class="{ struck: row[p] === 'extra' }">{{ row.track.title }}</div>
-              <div class="track-artist">{{ row.track.artists.join(', ') }}</div>
+              <div class="track-title" :class="{ struck: row[p] === 'extra' }">{{ row.copies[p]?.title || row.track.title }}</div>
+              <div class="track-artist">{{ [row.track.artists.join(', '), row.copies[p]?.album].filter(Boolean).join(' · ') }}</div>
               <div class="mono track-meta">
-                {{ [fmtDuration(row.track.durationMs), row.track.isrc].filter(Boolean).join(' · ') }}
+                {{ [fmtDuration(row.track.durationMs), row.copies[p] ? row.copies[p]!.isrc : row.track.isrc].filter(Boolean).join(' · ') }}
                 <span v-if="row[p] === 'unavailable'" class="tag">⊘ unavailable here</span>
                 <span v-if="row[p] === 'extra'" class="tag coral">− removed in main</span>
               </div>
@@ -363,6 +374,9 @@ const mainMark = (row: StatusRowView): Mark => row.main === 'active'
               <span class="mark" :title="sideMark(row.tidal, 'tidal').label" :aria-label="sideMark(row.tidal, 'tidal').label">
                 <ServiceIcon provider="tidal" :size="11" /><span :class="sideMark(row.tidal, 'tidal').tone">{{ sideMark(row.tidal, 'tidal').glyph }}</span>
               </span>
+            </div>
+            <div v-if="row.matchedBy" class="mono track-meta" :title="matchHelp[row.matchedBy]">
+              <span class="tag">{{ row.matchedBy === 'isrc' ? '= same ISRC' : '≈ matched by metadata' }}</span>
             </div>
           </div>
           <div class="cell end" :style="{ order: 5 }">

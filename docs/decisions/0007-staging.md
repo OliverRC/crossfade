@@ -46,3 +46,15 @@ M5 is built in slices, each stopping for Oliver to check:
 - Push progress is shown per collection and step on the hero card's push plan and on the Staged page, with the result kept after the push ends.
 
 Found while testing: Spotify still lists tracks it has pulled from its catalogue, with no name, artist, ISRC or duration. They are now read as unavailable on Spotify, like Tidal's pulled songs, and shown as "Unknown song".
+
+## Slice 3: push to Spotify (built 2026-10-04)
+
+Same push job as Tidal; the differences are all about the quota.
+
+- **Writes**, per the February 2026 changelog and tried in the M0 spike: playlist adds `POST /playlists/{id}/items` with `{ uris }` (100 per request); removals `DELETE` the same path with `{ items: [{ uri }] }`, which removes every occurrence; liked songs `PUT` and `DELETE /me/library?uris=…`, 40 per request. A batch Spotify refuses outright fails each of its songs; rate limits and server errors stop the push.
+- **Playlists are re-read** before writing, as on Tidal. It matters more here: Spotify playlists accept duplicates. Liked songs are not re-read; `PUT /me/library` is idempotent.
+- **Lookups are rationed.** Spotify has no batch ISRC lookup, only search (5 ISRCs per request when it honours `OR`, else 1). One push spends at most `SPOTIFY_LOOKUPS_PER_RUN` requests (default 150), saving each batch's matches as links as it goes. Songs not looked up stay staged without an error and are carried by the next push; there is no automatic resume, since a push only ever runs when Oliver presses it.
+- **`QUOTA_EXCEEDED` is never retried.** The push records the cooldown on the account and stops before writing anything; matches already found are kept. The Push button stays disabled, with the time, until the cooldown passes.
+- The Staged page's confirmation says how many songs need looking up and what one push will spend.
+
+Observed: the `QUOTA_EXCEEDED` on 2026-10-03 came with `Retry-After: 84469`, about 23.5 hours, longer than the 13 to 18 hours reported elsewhere.

@@ -271,17 +271,20 @@ export function createTidalWriter(country: string): PushWriter {
 
   return {
     id: 'tidal',
+    isrcBatchSize: 20,
+    lookupBudget: null,
 
     async findPlayableByIsrcs(isrcs) {
       const out = new Map<string, string>()
-      for (const batch of chunk([...new Set(isrcs)], 20)) {
+      const batches = chunk([...new Set(isrcs)], 20)
+      for (const batch of batches) {
         const res: any = await request('/tracks', { query: { 'filter[isrc]': batch, countryCode: country } })
         for (const r of res.data ?? []) {
           const isrc = r.attributes?.isrc?.toUpperCase()
           if (isrc && !out.has(isrc)) out.set(isrc, String(r.id))
         }
       }
-      return out
+      return { found: out, requests: batches.length }
     },
 
     async readPlaylist(playlistId) {
