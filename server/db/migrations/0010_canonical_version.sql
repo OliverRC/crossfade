@@ -1,0 +1,1 @@
+ALTER TABLE `canonical_tracks` ADD `version` text;

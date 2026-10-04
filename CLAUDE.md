@@ -5,7 +5,7 @@ Self-hosted two-way sync of one person's Spotify and Tidal libraries (liked song
 ## Status
 
 - Current milestone: **M4 Main and pull** (`docs/decisions/0005`). Done when pulling Tidal then Spotify builds a main Oliver agrees with, the Library page shows what each service is missing, and pulling again with nothing changed reports nothing new. V0 is done; its dry-run sync was replaced by pull.
-- In progress: M5 (push), in slices (`docs/decisions/0007`): staging is built (push sends only staged changes; new changes start unstaged), push to Tidal is next, then Spotify, then creating playlists. M3 (manual search and review) follows M5. A one-press sync (pull both, push both) waits until pull and push are trusted. Docker and Unraid packaging can slot in whenever he wants it deployed.
+- In progress: M5 (push), in slices (`docs/decisions/0007`): staging and push to Tidal are built (push sends only staged changes; new changes start unstaged); Oliver's first real Tidal push is to go to a test playlist. Push to Spotify is next, then creating playlists. M3 (manual search and review) follows M5. A one-press sync (pull both, push both) waits until pull and push are trusted. Docker and Unraid packaging can slot in whenever he wants it deployed.
 - Pulls are checkpointed and resumable, and pause on quota (`docs/decisions/0003`). Spotify's Development Mode quota is unpublished, with reported cooldowns of 13 to 18 hours: never retry `QUOTA_EXCEEDED`, and keep Spotify lookups rationed (they belong to push).
 - Work one milestone at a time. Stop at each milestone's "Done when" for Oliver to verify.
 
@@ -20,7 +20,7 @@ Self-hosted two-way sync of one person's Spotify and Tidal libraries (liked song
 ## Principles
 
 - The git model (`docs/decisions/0005`): main is the canonical library; Spotify and Tidal are equal remotes. Pull reads one service and updates main, never writing to a service. Push is the only code path that writes to Spotify or Tidal, and it always shows its changes before writing.
-- ISRC before anything fuzzy. Fuzzy matches are proposed for review, never auto-linked in the MVP.
+- ISRC first, then exact metadata across services (`docs/decisions/0008`), before anything fuzzy. Fuzzy matches are proposed for review, never auto-linked in the MVP.
 - Human decisions (manual links, ignores, dequeues) are stored and never re-litigated.
 - Failures and unmatched tracks are states on the item and clear themselves when resolved.
 - Simple over clever: full snapshots, in-memory diffing, one SQLite file, one container.
@@ -53,9 +53,9 @@ Spotify:
 - Development Mode quota: unpublished, shared across the developer account; `429` with `reason: QUOTA_EXCEEDED`, reported cooldowns of 13 to 18 hours.
 
 Tidal (`https://openapi.tidal.com/v2`, JSON:API, `application/vnd.api+json`):
-- Liked tracks: `/userCollectionTracks/me/relationships/items` (GET, POST, DELETE; max 50 per write).
+- Liked tracks: `/userCollectionTracks/me/relationships/items` (GET, POST, DELETE; body `{ data: [{ type: 'tracks', id }] }`, max 50 per write).
 - Owned playlists: `GET /playlists?filter[owners.id]=me`. Favourited playlists: `/userCollectionPlaylists/me/relationships/items`.
-- Playlist items: `/playlists/{id}/relationships/items`. Add accepts `meta.onDuplicates: SKIP`. Remove needs each entry's `meta.itemId`, not only the track ID.
+- Playlist items: `/playlists/{id}/relationships/items`. Add accepts `meta.onDuplicates: SKIP` and reports songs it did not add in the response's `meta.skipped` (`NOT_FOUND` or `ALREADY_PRESENT`). Remove body is `{ data: [{ type, id, meta: { itemId } }] }`; GET returns each entry's `meta.itemId`. Max 50 per write. Checked against spec 1.10.148 on 2026-10-04.
 - ISRC lookup: `GET /tracks?filter[isrc]=…`. Search: `/searchResults/{query}/relationships/tracks`.
 - OAuth: `https://login.tidal.com/authorize`, token `https://auth.tidal.com/v1/oauth2/token`, PKCE.
 

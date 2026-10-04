@@ -4,7 +4,7 @@ import type { ProviderPlaylist, ProviderTrack } from '../../shared/types'
 import { isoDurationToMs } from '../core/duration'
 import { getAccessToken } from '../utils/accounts'
 import { chunk, createClient, ProviderError } from './http'
-import type { MusicProvider } from './types'
+import type { MusicProvider, PlaylistEntry, PushWriter, WriteFailures } from './types'
 
 const BASE = 'https://openapi.tidal.com/v2'
 
@@ -215,4 +215,118 @@ export function createTidalPlaylistEditor(country: string): TidalPlaylistEditor 
 /** Same request, same key: a retried write is replayed by Tidal rather than applied twice. */
 function idempotencyKey(action: string, playlistId: string, items: PlaylistItemRef[]): string {
   return createHash('sha256').update(JSON.stringify([action, playlistId, items.map(i => `${i.type}:${i.id}`)])).digest('hex').slice(0, 64)
+}
+
+/**
+ * Push to Tidal (docs/decisions/0007). Requests per the published spec: playlist adds take `onDuplicates: SKIP` and
+ * report songs they could not add in `meta.skipped`; playlist removals name each entry by `meta.itemId`; liked songs
+ * are added and removed by track ID. All in batches of 50, each with an idempotency key so a retried request is
+ * replayed rather than applied twice.
+ */
+export function createTidalWriter(country: string): PushWriter {
+  const request = createClient('tidal', BASE, () => getAccessToken('tidal'), 'application/vnd.api+json')
+  const key = (action: string, target: string, ids: string[]) =>
+    createHash('sha256').update(JSON.stringify([action, target, ids])).digest('hex').slice(0, 64)
+
+  /**
+   * Liked songs have no "skip what is there": a batch with one song already liked (or already gone) may be refused
+   * as a conflict. Then each song is sent alone, and a conflict or not-found for one song means it is already done.
+   */
+  async function likedWrite(method: 'POST' | 'DELETE', trackIds: string[]): Promise<WriteFailures> {
+    const failures: WriteFailures = new Map()
+    const send = (ids: string[]) => request('/userCollectionTracks/me/relationships/items', {
+      method,
+      body: { data: ids.map(id => ({ type: 'tracks', id })) },
+      headers: { 'Idempotency-Key': key(`liked:${method}`, 'me', ids) },
+    })
+    // A conflict means already liked (adding) or already gone (removing); so does a not-found when removing. When
+    // adding, not-found means Tidal has no such track: a real failure. Server errors and rate limits stop the push.
+    const alreadyDone = (e: ProviderError) => e.status === 409 || (method === 'DELETE' && e.status === 404)
+    const fatal = (e: unknown) => !(e instanceof ProviderError) || e.status === 429 || e.status >= 500
+    for (const batch of chunk(trackIds, 50)) {
+      try {
+        await send(batch)
+        continue
+      } catch (error) {
+        if (fatal(error)) throw error
+        const e = error as ProviderError
+        // One song can sink a batch: retry them one by one to find it.
+        const split = batch.length > 1 && (e.status === 409 || e.status === 404)
+        if (!split) {
+          if (!alreadyDone(e)) for (const id of batch) failures.set(id, e.message)
+          continue
+        }
+      }
+      for (const id of batch) {
+        try {
+          await send([id])
+        } catch (error) {
+          if (fatal(error)) throw error
+          if (!alreadyDone(error as ProviderError)) failures.set(id, (error as ProviderError).message)
+        }
+      }
+    }
+    return failures
+  }
+
+  return {
+    id: 'tidal',
+
+    async findPlayableByIsrcs(isrcs) {
+      const out = new Map<string, string>()
+      for (const batch of chunk([...new Set(isrcs)], 20)) {
+        const res: any = await request('/tracks', { query: { 'filter[isrc]': batch, countryCode: country } })
+        for (const r of res.data ?? []) {
+          const isrc = r.attributes?.isrc?.toUpperCase()
+          if (isrc && !out.has(isrc)) out.set(isrc, String(r.id))
+        }
+      }
+      return out
+    },
+
+    async readPlaylist(playlistId) {
+      try {
+        const { data, included } = await readAll(request, `/playlists/${playlistId}/relationships/items`, { include: ['items'] })
+        const isrcOf = new Map(included.filter(r => r?.type === 'tracks').map(r => [String(r.id), r.attributes?.isrc?.toUpperCase() ?? null]))
+        return data.filter(r => r?.type === 'tracks')
+          .map((r): PlaylistEntry => ({ trackId: String(r.id), entryId: r.meta?.itemId ?? null, isrc: isrcOf.get(String(r.id)) ?? null }))
+      } catch (error) {
+        if (error instanceof ProviderError && error.status === 404) return null
+        throw error
+      }
+    },
+
+    async addToPlaylist(playlistId, trackIds) {
+      const failures: WriteFailures = new Map()
+      for (const batch of chunk(trackIds, 50)) {
+        const res: any = await request(`/playlists/${playlistId}/relationships/items`, {
+          method: 'POST',
+          body: { data: batch.map(id => ({ type: 'tracks', id })), meta: { onDuplicates: 'SKIP' } },
+          headers: { 'Idempotency-Key': key('playlist:add', playlistId, batch) },
+        })
+        // ALREADY_PRESENT is success; NOT_FOUND means Tidal would not add it.
+        for (const s of res?.meta?.skipped ?? []) {
+          if (s?.reason === 'NOT_FOUND') failures.set(String(s.id), 'Tidal would not add it: not available')
+        }
+      }
+      return failures
+    },
+
+    async removeFromPlaylist(playlistId, entries) {
+      const failures: WriteFailures = new Map()
+      const removable = entries.filter(e => e.entryId)
+      for (const e of entries.filter(e => !e.entryId)) failures.set(e.trackId, 'Tidal did not say which entry this is, so it cannot be removed')
+      for (const batch of chunk(removable, 50)) {
+        await request(`/playlists/${playlistId}/relationships/items`, {
+          method: 'DELETE',
+          body: { data: batch.map(e => ({ type: 'tracks', id: e.trackId, meta: { itemId: e.entryId } })) },
+          headers: { 'Idempotency-Key': key('playlist:remove', playlistId, batch.map(e => e.entryId!)) },
+        })
+      }
+      return failures
+    },
+
+    addLiked: ids => likedWrite('POST', ids),
+    removeLiked: ids => likedWrite('DELETE', ids),
+  }
 }

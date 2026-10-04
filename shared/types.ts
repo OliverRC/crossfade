@@ -30,7 +30,8 @@ export interface ProviderPlaylist {
 }
 
 export type LinkStatus = 'matched' | 'review' | 'unmatched' | 'ignored'
-export type LinkMethod = 'origin' | 'isrc' | 'fuzzy' | 'manual'
+/** metadata: equal cleaned-up title, artists and version, and lengths within 2 seconds (docs/decisions/0008). */
+export type LinkMethod = 'origin' | 'isrc' | 'metadata' | 'fuzzy' | 'manual'
 /** no_isrc_match: the ISRC lookup missed and fuzzy search was not tried, so a later pass can still find it. */
 export type UnmatchedReason = 'not_found' | 'no_isrc_match' | 'low_confidence' | 'ignored'
 
@@ -122,8 +123,15 @@ export interface StagedCollectionView {
   createsPlaylist: boolean
   /** Someone else's collaborative playlist: a push edits theirs. */
   ownerName: string | null
-  add: (TrackView & { canonicalTrackId: number })[]
-  remove: (TrackView & { canonicalTrackId: number })[]
+  add: StagedTrackView[]
+  remove: StagedTrackView[]
+}
+
+/** A staged song, with why the last push could not apply it, if it tried. */
+export interface StagedTrackView extends TrackView {
+  canonicalTrackId: number
+  error: string | null
+  attempts: number
 }
 
 /** What the next push to each service would do (docs/decisions/0007). */
@@ -152,18 +160,20 @@ export interface ConnectionView {
   scopes: string[]
 }
 
-export type StageKey = 'fetch:spotify' | 'fetch:tidal' | 'link' | 'pair' | 'match:tidal' | 'match:spotify' | 'diff' | 'merge' | 'cleanup'
+export type StageKey = 'fetch:spotify' | 'fetch:tidal' | 'link' | 'pair' | 'match:tidal' | 'match:spotify' | 'diff' | 'merge' | 'cleanup' | 'lookup' | 'write'
 export interface StageInfo { key: StageKey, label: string, help: string }
 
 const STAGE_INFO: Record<StageKey, Omit<StageInfo, 'key'>> = {
   'fetch:spotify': { label: 'Fetch Spotify', help: 'Liked songs and every playlist you own or collaborate on, saved as each one arrives. Playlists you only follow are listed but not read: Spotify does not let apps read them.' },
   'fetch:tidal': { label: 'Fetch Tidal', help: 'Liked songs and every playlist you own, saved as each one arrives. Songs Tidal lists but will not play in your country are kept, marked unavailable.' },
-  'link': { label: 'Link tracks', help: 'Every track becomes one canonical record; equal ISRCs on both services share one.' },
+  'link': { label: 'Link tracks', help: 'Every track becomes one canonical record; equal ISRCs on both services share one, then songs with the same title, artists, version and length (within 2 seconds).' },
   'pair': { label: 'Pair playlists', help: 'Liked songs with liked songs; playlists by a previous pairing or by name.' },
   'match:tidal': { label: 'Match on Tidal', help: 'Find Spotify-only tracks on Tidal by ISRC, 20 per request.' },
   'match:spotify': { label: 'Match on Spotify', help: 'Find Tidal-only tracks on Spotify by ISRC. Rationed: Spotify has a quota.' },
   'diff': { label: 'Build the diff', help: 'What a merge would add on each side. Nothing is written.' },
   'merge': { label: 'Merge into main', help: 'Changes since the last pull become changes in main. Conflicts and suspicious reads are held for you.' },
+  'lookup': { label: 'Find songs', help: 'Each staged song to add is found on the service: by an earlier link, or by ISRC. A song with no match stays staged with the reason.' },
+  'write': { label: 'Write', help: 'Each playlist is read again first, and only what it still needs is written. Results are saved song by song; a failure stays staged for the next push.' },
   'cleanup': { label: 'Clean up playlists', help: 'Merge exact copies into the one you keep, then delete the rest; delete empty playlists. Every deleted playlist is saved first.' },
 }
 
@@ -174,6 +184,8 @@ export type RunKind = 'sync' | 'apply' | 'pull' | 'push' | 'cleanup'
 export function stagesFor(run: { kind: RunKind, provider: ProviderId | null }): StageInfo[] {
   const keys: StageKey[] = run.kind === 'cleanup'
     ? ['cleanup']
+    : run.kind === 'push'
+      ? ['lookup', 'write']
     : run.kind === 'pull' && run.provider
       ? [`fetch:${run.provider}`, 'link', 'pair', 'merge']
       : ['fetch:spotify', 'fetch:tidal', 'link', 'pair', 'match:tidal', 'match:spotify', 'diff']
@@ -250,6 +262,25 @@ export interface RunProgress {
   /** The service the run in progress or last run pulled. */
   provider: ProviderId | null
   rev: number
+  /** The push in progress or last finished, step by step per collection; null for a pull. */
+  push?: PushProgress | null
+}
+
+export type PushStepStatus = 'waiting' | 'running' | 'done' | 'failed' | 'skipped'
+
+/** One step of one collection's push plan: how far it got and what went wrong. */
+export interface PushStepProgress {
+  status: PushStepStatus
+  total: number
+  done: number
+  failed: number
+  detail: string | null
+}
+
+/** A push to one service: per collection key, its add and remove steps (docs/decisions/0007). */
+export interface PushProgress {
+  provider: ProviderId
+  collections: Record<string, { name: string, add?: PushStepProgress, remove?: PushStepProgress }>
 }
 
 /** Playlist cleanup (docs/decisions/0004). exact: copies (merged); contained and different are shown only. */

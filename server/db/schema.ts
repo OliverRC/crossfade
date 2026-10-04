@@ -10,6 +10,8 @@ export const canonicalTracks = sqliteTable('canonical_tracks', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   isrc: text('isrc'),
   title: text('title').notNull(),
+  /** Tidal's version tag ("Live", "2011 Remaster"), kept apart from the title. Spotify puts it in the title. */
+  version: text('version'),
   artists: text('artists', { mode: 'json' }).$type<string[]>().notNull(),
   album: text('album').notNull(),
   durationMs: integer('duration_ms').notNull(),
@@ -225,4 +227,8 @@ export const stagedChanges = sqliteTable('staged_changes', {
   provider: text('provider').$type<ProviderId>().notNull(),
   change: text('change').$type<'add' | 'remove'>().notNull(),
   stagedAt: text('staged_at').notNull(),
+  /** The last push that tried this change and failed: why, how many times, when. Cleared when it succeeds. */
+  lastError: text('last_error'),
+  attempts: integer('attempts').notNull().default(0),
+  lastAttemptAt: text('last_attempt_at'),
 }, t => [uniqueIndex('staged_changes_collection_track_provider').on(t.collectionId, t.canonicalTrackId, t.provider)])

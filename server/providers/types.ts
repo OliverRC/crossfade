@@ -2,9 +2,7 @@ import type { ProviderId, ProviderPlaylist, ProviderTrack } from '../../shared/t
 import type { IsrcLookup } from './spotify-isrc'
 
 /**
- * The only code that talks to Spotify or Tidal implements this.
- * V0 is read-only; the write methods from the plan (addLiked, removeLiked, addToPlaylist,
- * removeFromPlaylist, createPlaylist) arrive in M5.
+ * The only code that talks to Spotify or Tidal implements this. Reads only; writes go through PushWriter.
  */
 export interface MusicProvider {
   readonly id: ProviderId
@@ -20,4 +18,31 @@ export interface MusicProvider {
   search(query: string): Promise<ProviderTrack[]>
   /** How lookups are being made, when that was learned at runtime (Spotify's OR support). */
   lookupMode?(): string | null
+}
+
+/** A song as a playlist holds it: the service's track ID and the entry's own ID, which removal needs on Tidal. */
+export interface PlaylistEntry {
+  trackId: string
+  /** Tidal's per-entry ID (`meta.itemId`); Spotify removes by URI and has none. */
+  entryId: string | null
+  isrc: string | null
+}
+
+/** Each song a write could not apply, by the service's track ID, with the service's reason. */
+export type WriteFailures = Map<string, string>
+
+/**
+ * Push's write path to one service (docs/decisions/0007): the only code that changes a real library, apart from
+ * the Tidal playlist cleanup. Every write is idempotent: adding what is there or removing what is not succeeds.
+ */
+export interface PushWriter {
+  readonly id: ProviderId
+  /** A track this service offers in the account's country, per ISRC that has one. */
+  findPlayableByIsrcs(isrcs: string[]): Promise<Map<string, string>>
+  /** The playlist's entries now, or null when it no longer exists. */
+  readPlaylist(playlistId: string): Promise<PlaylistEntry[] | null>
+  addToPlaylist(playlistId: string, trackIds: string[]): Promise<WriteFailures>
+  removeFromPlaylist(playlistId: string, entries: PlaylistEntry[]): Promise<WriteFailures>
+  addLiked(trackIds: string[]): Promise<WriteFailures>
+  removeLiked(trackIds: string[]): Promise<WriteFailures>
 }

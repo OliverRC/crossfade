@@ -3,6 +3,7 @@ import type { ProviderTrack } from '../shared/types'
 import { normaliseText, splitTitle, versionKind } from '../server/core/normalise'
 import { REVIEW_FLOOR, durationScore, pickIsrcResult, scoreMatch } from '../server/core/score'
 import { isoDurationToMs } from '../server/core/duration'
+import { type MatchSong, type MetadataMerge, metadataKey, metadataMerges } from '../server/core/match'
 
 const track = (over: Partial<ProviderTrack>): ProviderTrack => ({
   providerTrackId: 'x', isrc: null, title: 'Song', artists: ['Artist'], album: 'Album',
@@ -95,5 +96,35 @@ describe('ISO durations', () => {
     expect(isoDurationToMs('PT3M58S')).toBe(238_000)
     expect(isoDurationToMs('PT1H2M3.5S')).toBe(3_723_500)
     expect(isoDurationToMs('garbage')).toBe(0)
+  })
+})
+
+describe('metadata matching (decision 0008)', () => {
+  const song = (id: number, providers: ('spotify' | 'tidal')[], over: Partial<MatchSong> = {}): MatchSong =>
+    ({ id, title: 'Always', version: null, artists: ['Gavin James'], durationMs: 200_000, providers, ...over })
+
+  const cases: { name: string, songs: MatchSong[], merges: MetadataMerge[] }[] = [
+    { name: 'same song, different ISRC on each service', songs: [song(1, ['spotify']), song(2, ['tidal'])], merges: [{ keep: 1, merge: [2] }] },
+    { name: 'single on one service, album on the other, both already linked both ways', songs: [song(1, ['spotify', 'tidal']), song(2, ['spotify', 'tidal'])], merges: [{ keep: 1, merge: [2] }] },
+    { name: 'keeps the song on more services', songs: [song(1, ['tidal']), song(2, ['spotify', 'tidal'])], merges: [{ keep: 2, merge: [1] }] },
+    { name: 'version spelled differently ("- Remastered" vs "(Remastered)")', songs: [song(1, ['spotify'], { title: 'Such Great Heights - Remastered' }), song(2, ['tidal'], { title: 'Such Great Heights (Remastered)' })], merges: [{ keep: 1, merge: [2] }] },
+    { name: 'featured artists in the title or the artist list', songs: [song(1, ['spotify'], { title: 'Genius', artists: ['LSD', 'Sia'] }), song(2, ['tidal'], { title: 'Genius (feat. Sia)', artists: ['LSD'] })], merges: [{ keep: 1, merge: [2] }] },
+    { name: 'case, accents and punctuation', songs: [song(1, ['spotify'], { title: 'did you/fall apart' }), song(2, ['tidal'], { title: 'Did You / Fall Apart' })], merges: [{ keep: 1, merge: [2] }] },
+    { name: 'within 2 seconds', songs: [song(1, ['spotify']), song(2, ['tidal'], { durationMs: 202_000 })], merges: [{ keep: 1, merge: [2] }] },
+    { name: 'more than 2 seconds apart', songs: [song(1, ['spotify']), song(2, ['tidal'], { durationMs: 202_001 })], merges: [] },
+    { name: "Tidal's separate version field counts", songs: [song(1, ['spotify']), song(2, ['tidal'], { version: 'Live' })], merges: [] },
+    { name: 'different versions', songs: [song(1, ['spotify'], { title: 'Mine - Radio Edit' }), song(2, ['tidal'], { title: 'Mine' })], merges: [] },
+    { name: 'different artists', songs: [song(1, ['spotify']), song(2, ['tidal'], { artists: ['Someone Else'] })], merges: [] },
+    { name: 'two copies only one service holds stay apart', songs: [song(1, ['tidal']), song(2, ['tidal'])], merges: [] },
+    { name: 'two copies on one service matching one on the other is ambiguous', songs: [song(1, ['spotify']), song(2, ['tidal']), song(3, ['tidal'])], merges: [] },
+    { name: 'songs with no title never match', songs: [song(1, ['spotify'], { title: '' }), song(2, ['tidal'], { title: '' })], merges: [] },
+    { name: 'lengths do not drift along a chain', songs: [song(1, ['spotify']), song(2, ['tidal'], { durationMs: 201_500 }), song(3, ['tidal'], { durationMs: 203_000 })], merges: [{ keep: 1, merge: [2] }] },
+  ]
+  it.each(cases)('$name', ({ songs, merges }) => {
+    expect(metadataMerges(songs)).toEqual(merges)
+  })
+
+  it('a key ignores artist order', () => {
+    expect(metadataKey('Song', null, ['B', 'A'])).toBe(metadataKey('Song', null, ['a', 'b']))
   })
 })

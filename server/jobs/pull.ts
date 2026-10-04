@@ -1,8 +1,9 @@
 // Pull one service into main (docs/decisions/0005), in checkpointed stages: fetch its liked songs and owned
 // playlists, link every track to a canonical record, pair playlists with main's collections, then merge each
 // collection's changes since the service's last snapshot into main. Reads from the service only; never writes to it.
-import { and, eq, isNull } from 'drizzle-orm'
+import { and, eq, inArray, isNull } from 'drizzle-orm'
 import type { HoldReason, ProviderId, ProviderPlaylist, ProviderTrack, RunPause, SnapshotItem, StageKey } from '../../shared/types'
+import { metadataMerges } from '../core/match'
 import { normaliseText } from '../core/normalise'
 import { pull, type MainEntry } from '../core/pull'
 import { getProvider } from '../providers'
@@ -123,11 +124,15 @@ export async function runPull(
     provider, kind: c.kind, providerCollectionId: c.kind === 'liked' ? null : c.collectionKey, name: c.name, tracks: c.tracks,
   }))
 
-  // 2. Link: every track maps to one canonical record; equal ISRCs share one. Idempotent.
+  // 2. Link: every track maps to one canonical record; equal ISRCs share one, then equal metadata across services
+  // (docs/decisions/0008). Idempotent.
   log.stage('link', { status: 'running', detail: null })
-  report('link', 'Linking tracks by ISRC')
+  report('link', 'Linking tracks by ISRC, then by metadata')
   const canonicalOf = linkTracks(fetched)
-  log.stage('link', { status: 'done', detail: `${count(canonicalOf.created, 'new canonical record')}, ${count(canonicalOf.merged, 'linked')} to an existing one by ISRC` })
+  const joined = mergeByMetadata()
+  for (const [id, keep] of joined.into) for (const [trackId, canonicalId] of canonicalOf.ids) if (canonicalId === id) canonicalOf.ids.set(trackId, keep)
+  if (joined.songs) log.event('info', 'link', `Joined ${count(joined.songs, 'song')} to the same song on the other service by title, artists, version and length (their ISRCs differ)`)
+  log.stage('link', { status: 'done', detail: `${count(canonicalOf.created, 'new canonical record')}, ${count(canonicalOf.merged, 'linked')} to an existing one by ISRC${joined.songs ? `, ${joined.songs} by metadata` : ''}` })
 
   // 3. Pair collections: liked with liked, playlists by stored link or normalised name. Idempotent.
   log.stage('pair', { status: 'running', detail: null })
@@ -306,7 +311,7 @@ function linkTracks(fetched: FetchedCollection[]): { ids: Map<string, number>, c
         let canonicalId = t.isrc ? canonicalByIsrc.get(t.isrc) : undefined
         const method = canonicalId ? 'isrc' : 'origin'
         if (!canonicalId) {
-          canonicalId = tx.insert(schema.canonicalTracks).values({ isrc: t.isrc, title: t.title, artists: t.artists, album: t.album, durationMs: t.durationMs })
+          canonicalId = tx.insert(schema.canonicalTracks).values({ isrc: t.isrc, title: t.title, version: t.version, artists: t.artists, album: t.album, durationMs: t.durationMs })
             .returning({ id: schema.canonicalTracks.id }).get().id
           if (t.isrc) canonicalByIsrc.set(t.isrc, canonicalId)
           created++
@@ -329,6 +334,74 @@ function linkTracks(fetched: FetchedCollection[]): { ids: Map<string, number>, c
     }
   })
   return { ids, created, merged }
+}
+
+/**
+ * Fold songs that are one song by metadata into one canonical record (docs/decisions/0008): links, memberships,
+ * snapshots, staged changes and conflicts move to the song that stays. Idempotent: once folded, nothing matches again.
+ */
+export function mergeByMetadata(): { songs: number, into: Map<number, number> } {
+  const db = useDb()
+  const providersOf = new Map<number, Set<ProviderId>>()
+  for (const l of db.select().from(schema.trackLinks).all()) {
+    if (l.providerTrackId) providersOf.set(l.canonicalTrackId, (providersOf.get(l.canonicalTrackId) ?? new Set()).add(l.provider))
+  }
+  const merges = metadataMerges(db.select().from(schema.canonicalTracks).all().map(c => ({
+    id: c.id, title: c.title, version: c.version, artists: c.artists, durationMs: c.durationMs, providers: [...providersOf.get(c.id) ?? []],
+  })))
+  const into = new Map<number, number>()
+  if (!merges.length) return { songs: 0, into }
+
+  db.transaction((tx) => {
+    for (const { keep, merge } of merges) {
+      for (const gone of merge) into.set(gone, keep)
+      const links = tx.select().from(schema.trackLinks).where(inArray(schema.trackLinks.canonicalTrackId, [keep, ...merge])).all()
+      const kept = links.filter(l => l.canonicalTrackId === keep)
+      for (const l of links.filter(l => l.canonicalTrackId !== keep)) {
+        const real = (p: ProviderId) => kept.some(k => k.provider === p && k.providerTrackId)
+        // An unmatched or review placeholder is stale once the song has a real copy on that service.
+        if (!l.providerTrackId && real(l.provider)) { tx.delete(schema.trackLinks).where(eq(schema.trackLinks.id, l.id)).run(); continue }
+        const preferred = l.isPreferred && !kept.some(k => k.provider === l.provider && k.isPreferred)
+        tx.update(schema.trackLinks).set({ canonicalTrackId: keep, method: l.providerTrackId ? 'metadata' : l.method, isPreferred: preferred })
+          .where(eq(schema.trackLinks.id, l.id)).run()
+        kept.push({ ...l, canonicalTrackId: keep, isPreferred: preferred })
+      }
+      for (const l of kept.filter(k => !k.providerTrackId && kept.some(o => o.provider === k.provider && o.providerTrackId))) {
+        tx.delete(schema.trackLinks).where(eq(schema.trackLinks.id, l.id)).run()
+      }
+
+      // Memberships: where both songs are in a collection, the newer change wins, and an active one beats a removal.
+      const rows = tx.select().from(schema.memberships).where(inArray(schema.memberships.canonicalTrackId, [keep, ...merge])).all()
+      for (const collectionId of new Set(rows.map(r => r.collectionId))) {
+        const here = rows.filter(r => r.collectionId === collectionId)
+          .sort((a, b) => Number(b.state === 'active') - Number(a.state === 'active') || b.changedAt.localeCompare(a.changedAt))
+        const [winner, ...losers] = here
+        for (const r of losers) tx.delete(schema.memberships).where(eq(schema.memberships.id, r.id)).run()
+        if (winner!.canonicalTrackId !== keep) tx.update(schema.memberships).set({ canonicalTrackId: keep }).where(eq(schema.memberships.id, winner!.id)).run()
+      }
+
+      // Staged picks and open conflicts: one per collection and service at most; a duplicate goes. Settled conflicts all move.
+      for (const table of [schema.stagedChanges, schema.conflicts] as const) {
+        const picks = tx.select().from(table).where(inArray(table.canonicalTrackId, [keep, ...merge])).all()
+        const keyOf = (p: typeof picks[number]) => 'resolvedAt' in p && p.resolvedAt ? `settled:${p.id}` : `${p.collectionId}:${p.provider}`
+        const seen = new Set(picks.filter(p => p.canonicalTrackId === keep).map(keyOf))
+        for (const p of picks.filter(p => p.canonicalTrackId !== keep)) {
+          const k = keyOf(p)
+          if (seen.has(k)) tx.delete(table).where(eq(table.id, p.id)).run()
+          else { seen.add(k); tx.update(table).set({ canonicalTrackId: keep }).where(eq(table.id, p.id)).run() }
+        }
+      }
+      tx.delete(schema.canonicalTracks).where(inArray(schema.canonicalTracks.id, merge)).run()
+    }
+
+    // Snapshots: a service holding two releases of the song now holds it twice, under each release's ID.
+    for (const snap of tx.select().from(schema.snapshots).all()) {
+      if (!snap.items.some(i => into.has(i.canonicalTrackId))) continue
+      const items = snap.items.map(i => ({ ...i, canonicalTrackId: into.get(i.canonicalTrackId) ?? i.canonicalTrackId }))
+      tx.update(schema.snapshots).set({ items }).where(eq(schema.snapshots.id, snap.id)).run()
+    }
+  })
+  return { songs: into.size, into }
 }
 
 /**

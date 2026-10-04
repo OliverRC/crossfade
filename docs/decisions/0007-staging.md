@@ -32,3 +32,17 @@ M5 is built in slices, each stopping for Oliver to check:
 2. Push to Tidal: no scarce quota and 20 ISRCs per lookup, so the safe first writer. Tried on the test playlist first.
 3. Push to Spotify: rationed lookups, pausing and resuming on quota.
 4. Creating playlists on the other service.
+
+## Slice 2: push to Tidal (built 2026-10-04)
+
+- Push starts only from the Staged page, after a second press on an inline confirmation that names the adds and, in coral, the removals. It runs in the background behind the same lock as pulls, and is an Activity entry marked "Wrote to Tidal".
+- **Finding songs.** Each song to add uses its existing Tidal link (preferring the preferred one), else an ISRC lookup in the account's country, 20 per request, saved as a new link. A song with no ISRC, or none Tidal offers, stays staged with that reason; manual search (M3) is for those.
+- **Playlists are re-read** before writing. A song already there, under any ID with the same ISRC, counts as done without a write. Adds use `onDuplicates: SKIP`, and a song Tidal reports as `NOT_FOUND` in `meta.skipped` fails on its own. Removals name every entry of the song by `meta.itemId`.
+- **Liked songs are not re-read**: about 6,500 songs at 20 a page costs minutes and many requests. Their writes are idempotent instead: a batch Tidal refuses with a conflict or not-found is retried one song at a time, and "already liked" or "already gone" counts as done.
+- **Results per song.** A success updates Tidal's snapshot for that collection song by song (never rebuilt from the re-read, so the next pull still sees other changes made on Tidal) and leaves the stage. A failure stays staged with its reason, attempt count and time, shown on the Staged page.
+- **Stopping partway** (rate limit, server error) is safe: what was written is recorded, the rest stays staged, and the next push re-reads first.
+- Main is never changed by a push.
+- Playlists Tidal does not have yet are skipped without an error, waiting for slice 4.
+- Push progress is shown per collection and step on the hero card's push plan and on the Staged page, with the result kept after the push ends.
+
+Found while testing: Spotify still lists tracks it has pulled from its catalogue, with no name, artist, ISRC or duration. They are now read as unavailable on Spotify, like Tidal's pulled songs, and shown as "Unknown song".

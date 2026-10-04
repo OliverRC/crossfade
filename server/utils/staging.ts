@@ -2,7 +2,7 @@
 // Changes are derived from main and each service's snapshot; only the picks are stored. A pick whose change no longer
 // exists (a pull found the service already matches, or main changed) is stale and is pruned.
 import { and, eq, inArray } from 'drizzle-orm'
-import type { ProviderId, StagedView, TrackView } from '../../shared/types'
+import type { ProviderId, StagedTrackView, StagedView, TrackView } from '../../shared/types'
 import { PROVIDERS } from '../../shared/types'
 import { status, type Change } from '../core/status'
 import { schema, useDb } from './db'
@@ -34,6 +34,11 @@ function pendingChanges(filter: ChangeFilter = {}): PendingChange[] {
     }
   }
   return out
+}
+
+/** The staged changes that still exist for one service: what its next push sends. */
+export function stagedChanges(provider: ProviderId): { collectionId: number, canonicalTrackId: number, change: Change }[] {
+  return pendingChanges({ provider }).filter(c => c.staged).map(({ collectionId, canonicalTrackId, change }) => ({ collectionId, canonicalTrackId, change }))
 }
 
 /** Stage or unstage every current change matching the filter. Returns how many changed. */
@@ -73,9 +78,14 @@ export function stagedView(): StagedView {
   const tracks = new Map(ids.length
     ? db.select().from(schema.canonicalTracks).where(inArray(schema.canonicalTracks.id, ids)).all().map(t => [t.id, t])
     : [])
-  const track = (id: number): TrackView & { canonicalTrackId: number } => {
-    const t = tracks.get(id)
-    return { canonicalTrackId: id, title: t?.title ?? 'Unknown', artists: t?.artists ?? [], durationMs: t?.durationMs ?? 0, isrc: t?.isrc ?? null }
+  const picks = new Map(db.select().from(schema.stagedChanges).all().map(r => [`${r.collectionId}:${r.canonicalTrackId}:${r.provider}`, r]))
+  const track = (c: PendingChange): StagedTrackView => {
+    const t = tracks.get(c.canonicalTrackId)
+    const pick = picks.get(`${c.collectionId}:${c.canonicalTrackId}:${c.provider}`)
+    return {
+      canonicalTrackId: c.canonicalTrackId, title: t?.title || 'Unknown song', artists: t?.artists ?? [], durationMs: t?.durationMs ?? 0, isrc: t?.isrc ?? null,
+      error: pick?.lastError ?? null, attempts: pick?.attempts ?? 0,
+    }
   }
   const byTitle = (a: TrackView, b: TrackView) => a.title.localeCompare(b.title)
 
@@ -93,8 +103,8 @@ export function stagedView(): StagedView {
           // A playlist push would have to create on the service first.
           createsPlaylist: collection.kind === 'playlist' && !link,
           ownerName: link?.access === 'collaborative' ? link.ownerName : null,
-          add: here.filter(c => c.change === 'add').map(c => track(c.canonicalTrackId)).sort(byTitle),
-          remove: here.filter(c => c.change === 'remove').map(c => track(c.canonicalTrackId)).sort(byTitle),
+          add: here.filter(c => c.change === 'add').map(track).sort(byTitle),
+          remove: here.filter(c => c.change === 'remove').map(track).sort(byTitle),
         }
       })
       .sort((a, b) => Number(b.kind === 'liked') - Number(a.kind === 'liked') || a.name.localeCompare(b.name))

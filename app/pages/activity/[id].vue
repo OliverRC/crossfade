@@ -43,7 +43,7 @@ async function resume() {
         <div class="head-top">
           <h1 class="display title">{{ runTitle(run) }} #{{ run.id }}</h1>
           <span class="pill small" :class="runStatusPill[run.status].cls">{{ live ? 'Running now' : runStatusPill[run.status].label }}</span>
-          <span v-if="run.kind === 'cleanup'" class="pill small solid-coral">− Wrote to Tidal</span>
+          <span v-if="run.kind === 'cleanup' || run.kind === 'push'" class="pill small solid-coral">− Wrote to {{ run.provider === 'spotify' ? 'Spotify' : 'Tidal' }}</span>
           <button v-if="run.kind === 'pull' && (run.status === 'paused' || run.status === 'failed')" type="button" class="pill small" @click="resume">Resume now</button>
         </div>
         <div class="mono meta">

@@ -7,7 +7,10 @@ import type { MusicProvider } from './types'
 
 export function toSpotifyTrack(t: any): ProviderTrack | null {
   if (!t || t.type !== 'track' || t.is_local || !t.id) return null
+  // A track Spotify has pulled from its catalogue is still listed, but with no name, artist, ISRC or duration.
+  const pulled = !t.name && !t.duration_ms
   return {
+    ...(pulled ? { available: false } : {}),
     providerTrackId: t.id,
     isrc: t.external_ids?.isrc?.toUpperCase() ?? null,
     title: t.name,

@@ -1,20 +1,46 @@
 <script setup lang="ts">
-// Staged (docs/decisions/0007): what the next push to each service will do. Removals are listed apart from adds so
-// they are always seen before anything is written. Push itself arrives in the next step of M5.
-import type { ConnectionView, ProviderId, StagedCollectionView, StagedView } from '~~/shared/types'
+// Staged (docs/decisions/0007): what the next push to each service will do, and the only place a push starts.
+// Removals are listed apart from adds so they are always seen before anything is written, and Push asks once more.
+import type { ConnectionView, ProviderId, PushStepProgress, StagedCollectionView, StagedTrackView, StagedView } from '~~/shared/types'
 
 const { data: connections } = await useFetch<ConnectionView[]>('/api/connections')
 const { data: view, refresh } = await useFetch<StagedView>('/api/staged')
 const actionError = ref<string | null>(null)
+const progress = useRunProgress(() => refresh())
+const running = computed(() => progress.value?.running ?? false)
+/** The service whose push is waiting for a second press. */
+const confirming = ref<ProviderId | null>(null)
 
 const names = { spotify: 'Spotify', tidal: 'Tidal' } as const
 const PROVIDERS = ['spotify', 'tidal'] as const
-const NOT_YET = 'Writing arrives in the next step of M5. Staging is saved until then.'
+/** Services push can write to so far (M5 slice 2: Tidal). */
+const PUSHABLE: ProviderId[] = ['tidal']
+const NOT_YET = 'Push to Spotify comes in the next step of M5. Staging is saved until then.'
 const total = computed(() => PROVIDERS.reduce((n, p) => n + (view.value?.[p].add ?? 0) + (view.value?.[p].remove ?? 0), 0))
 const plural = (n: number, word: string) => `${n.toLocaleString('en-GB')} ${word}${n === 1 ? '' : 's'}`
 const fmtDuration = (ms: number) => `${Math.floor(ms / 60000)}:${String(Math.round((ms % 60000) / 1000)).padStart(2, '0')}`
 const withRemovals = (p: ProviderId) => (view.value?.[p].collections ?? []).filter(c => c.remove.length)
 const withAdds = (p: ProviderId) => (view.value?.[p].collections ?? []).filter(c => c.add.length)
+
+/** Staged songs in playlists the service does not have yet: they wait for playlist creation. */
+const waitingForCreate = (p: ProviderId) => (view.value?.[p].collections ?? []).filter(c => c.createsPlaylist).reduce((n, c) => n + c.add.length, 0)
+const failedIn = (p: ProviderId) => (view.value?.[p].collections ?? []).reduce((n, c) => n + [...c.add, ...c.remove].filter(t => t.error).length, 0)
+
+async function push(p: ProviderId) {
+  actionError.value = null
+  confirming.value = null
+  try {
+    await $fetch(`/api/push/${p}`, { method: 'POST' })
+  } catch (e: any) {
+    actionError.value = e?.data?.statusMessage ?? 'The push did not start'
+  }
+}
+
+/** This collection's step in the running or last push to the service. */
+const stepOf = (p: ProviderId, c: StagedCollectionView, change: 'add' | 'remove'): PushStepProgress | undefined =>
+  progress.value?.push?.provider === p ? progress.value.push.collections[c.key]?.[change] : undefined
+const STEP_TEXT: Record<PushStepProgress['status'], string> = { waiting: 'waiting', running: 'pushing…', done: 'pushed', failed: 'failed', skipped: 'waiting for playlist creation' }
+const tried = (t: StagedTrackView) => (t.attempts === 1 ? 'tried once' : `tried ${t.attempts} times`)
 
 async function unstage(filter: { collection?: string, track?: number, provider: ProviderId }) {
   actionError.value = null
@@ -44,6 +70,11 @@ const where = (c: StagedCollectionView) => [
       </p>
     </section>
 
+    <div v-if="!running && progress?.push && progress.runId" class="banner" :class="progress.phase === 'failed' ? 'error' : 'ok'" role="status">
+      {{ progress.message }} <NuxtLink :to="`/activity/${progress.runId}`">See what it did</NuxtLink>
+    </div>
+    <div v-else-if="running && progress?.phase === 'push'" class="banner pause" role="status">{{ progress.message }}…</div>
+
     <p v-if="!total" class="card muted empty">Nothing is staged. <NuxtLink to="/">Pick changes on the Library page.</NuxtLink></p>
 
     <template v-for="p in PROVIDERS" :key="p">
@@ -55,10 +86,27 @@ const where = (c: StagedCollectionView) => [
               <span class="mint">+ {{ view[p].add.toLocaleString('en-GB') }}</span>
               <span class="coral">− {{ view[p].remove.toLocaleString('en-GB') }}</span>
             </span>
-            <button type="button" class="pill small" @click="unstage({ provider: p })">Unstage all</button>
-            <button type="button" class="pill small solid-coral" disabled :title="NOT_YET">Push to {{ names[p] }}</button>
+            <button type="button" class="pill small" :disabled="running" @click="unstage({ provider: p })">Unstage all</button>
+            <button
+              type="button" class="pill small solid-coral" :disabled="!PUSHABLE.includes(p) || running" :title="PUSHABLE.includes(p) ? '' : NOT_YET"
+              @click="confirming = p"
+            >{{ running && progress?.provider === p ? 'Pushing…' : `Push to ${names[p]}` }}</button>
           </div>
         </div>
+
+        <div v-if="confirming === p" class="confirm" role="alertdialog" :aria-label="`Confirm push to ${names[p]}`">
+          <p>
+            <strong>Write to {{ names[p] }} now?</strong>
+            This adds {{ plural(view[p].add - waitingForCreate(p), 'song') }}<template v-if="view[p].remove"> and <strong class="coral-text">removes {{ plural(view[p].remove, 'song') }}</strong> (listed below)</template>.
+            Each playlist is read again first and only what it still needs is written. Songs that fail stay staged with the reason.
+          </p>
+          <p v-if="waitingForCreate(p)" class="muted">{{ plural(waitingForCreate(p), 'song') }} in playlists {{ names[p] }} does not have yet will wait: creating playlists comes in a later step.</p>
+          <div class="confirm-actions">
+            <button type="button" class="pill small solid-coral" @click="push(p)">Push now</button>
+            <button type="button" class="pill small" @click="confirming = null">Cancel</button>
+          </div>
+        </div>
+        <p v-if="failedIn(p) && !running" class="mono failed-note">! {{ plural(failedIn(p), 'song') }} failed on the last push and {{ failedIn(p) === 1 ? 'is' : 'are' }} still staged; the reason is under each one.</p>
 
         <div v-if="view[p].remove" class="block removals">
           <h3 class="block-title"><span class="badge b-coral" aria-hidden="true">−</span>Remove from {{ names[p] }} · {{ plural(view[p].remove, 'song') }}</h3>
@@ -66,14 +114,16 @@ const where = (c: StagedCollectionView) => [
             <div class="group-head">
               <span class="group-name">{{ c.name }}</span>
               <span v-if="where(c)" class="label">{{ where(c) }}</span>
+              <span v-if="stepOf(p, c, 'remove')" class="mono step" :class="stepOf(p, c, 'remove')!.status">{{ STEP_TEXT[stepOf(p, c, 'remove')!.status] }}</span>
             </div>
             <div v-for="t in c.remove" :key="t.canonicalTrackId" class="song">
               <div class="song-text">
                 <span class="song-title">{{ t.title }}</span>
                 <span class="muted">{{ t.artists.join(', ') }}</span>
+                <span v-if="t.error" class="mono error-text">! {{ t.error }} · {{ tried(t) }}</span>
               </div>
               <span class="mono meta">{{ [fmtDuration(t.durationMs), t.isrc].filter(Boolean).join(' · ') }}</span>
-              <button type="button" class="pill small" @click="unstage({ collection: c.key, track: t.canonicalTrackId, provider: p })">Unstage</button>
+              <button type="button" class="pill small" @click="unstage({ collection: c.key, track: t.canonicalTrackId, provider: p })" :disabled="running">Unstage</button>
             </div>
           </div>
         </div>
@@ -85,15 +135,17 @@ const where = (c: StagedCollectionView) => [
               <span class="group-name">{{ c.name }}</span>
               <span class="mono meta">{{ plural(c.add.length, 'song') }}</span>
               <span v-if="where(c)" class="label" :class="{ mint: c.createsPlaylist }">{{ where(c) }}</span>
-              <button type="button" class="pill small group-unstage" @click.prevent="unstage({ collection: c.key, provider: p })">Unstage playlist</button>
+              <span v-if="stepOf(p, c, 'add')" class="mono step" :class="stepOf(p, c, 'add')!.status">{{ STEP_TEXT[stepOf(p, c, 'add')!.status] }}</span>
+              <button type="button" class="pill small group-unstage" :disabled="running" @click.prevent="unstage({ collection: c.key, provider: p })">Unstage playlist</button>
             </summary>
             <div v-for="t in c.add" :key="t.canonicalTrackId" class="song">
               <div class="song-text">
                 <span class="song-title">{{ t.title }}</span>
                 <span class="muted">{{ t.artists.join(', ') }}</span>
+                <span v-if="t.error" class="mono error-text">! {{ t.error }} · {{ tried(t) }}</span>
               </div>
               <span class="mono meta">{{ [fmtDuration(t.durationMs), t.isrc].filter(Boolean).join(' · ') }}</span>
-              <button type="button" class="pill small" @click="unstage({ collection: c.key, track: t.canonicalTrackId, provider: p })">Unstage</button>
+              <button type="button" class="pill small" @click="unstage({ collection: c.key, track: t.canonicalTrackId, provider: p })" :disabled="running">Unstage</button>
             </div>
           </details>
         </div>
@@ -120,6 +172,15 @@ const where = (c: StagedCollectionView) => [
 .badge { display: inline-grid; place-items: center; width: 24px; height: 24px; border-radius: 50%; font-weight: 700; font-size: 13px; flex: none; }
 .b-mint { background: var(--mint); color: var(--on-accent); }
 .b-coral { background: var(--coral); color: var(--on-accent); }
+.confirm { margin-top: 16px; padding: 16px; border-radius: var(--radius-row); border: 1.5px solid var(--coral); background: rgba(255, 68, 56, 0.08); line-height: 1.5; }
+.confirm p { margin: 0 0 8px; }
+.confirm-actions { display: flex; gap: 8px; margin-top: 12px; }
+.coral-text { color: var(--coral); }
+.failed-note { margin: 12px 0 0; font-size: 12px; color: #ffb3ad; }
+.error-text { font-size: 11px; color: #ffb3ad; overflow-wrap: anywhere; }
+.step { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); }
+.step.done { color: var(--mint); }
+.step.failed { color: var(--coral); }
 .group { border-top: 1px solid var(--hairline); padding: 6px 0; }
 .group-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-height: 40px; cursor: pointer; }
 .group-name { font-weight: 600; }

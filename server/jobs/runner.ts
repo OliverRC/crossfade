@@ -5,9 +5,12 @@ import { EventEmitter } from 'node:events'
 import { and, desc, eq } from 'drizzle-orm'
 import type { ProviderId, RunProgress } from '../../shared/types'
 import { PROVIDERS } from '../../shared/types'
+import { requestCounts } from '../providers/http'
 import { schema, useDb } from '../utils/db'
 import { acquire, lockHolder, release } from './lock'
 import { runPull } from './pull'
+import { runPush } from './push'
+import type { PushWriter } from '../providers/types'
 import { pruneStaged } from '../utils/staging'
 import { providerNames } from './quota'
 import { createRunLog, resetUnfinishedStages } from './run-log'
@@ -74,7 +77,7 @@ export function startPull(provider: ProviderId, trigger: 'manual' | 'schedule' =
       ? db.update(schema.syncRuns).set({ status: 'running', error: null, pause: null, trigger, attempts: resumable.attempts + 1, stages: resetUnfinishedStages(resumable.stages) })
         .where(eq(schema.syncRuns.id, resumable.id)).returning().get()
       : db.insert(schema.syncRuns).values({ kind: 'pull', provider, trigger, startedAt: new Date().toISOString(), status: 'running', attempts: 1, stages: {} }).returning().get()
-    update({ running: true, phase: 'start', message: resumable ? `Resuming the ${name} pull` : `Pulling ${name}`, done: 0, total: 0, error: null, resumeAt: null, runId: run.id, provider })
+    update({ running: true, phase: 'start', message: resumable ? `Resuming the ${name} pull` : `Pulling ${name}`, done: 0, total: 0, error: null, resumeAt: null, runId: run.id, provider, push: null })
     const log = createRunLog(run.id, () => update({ rev: progress.rev + 1 }))
     const by = trigger === 'schedule' ? 'automatically' : 'by you'
     log.event('info', null, resumable
@@ -121,4 +124,50 @@ export function startPull(provider: ProviderId, trigger: 'manual' | 'schedule' =
     throw error
   }
   return run.id
+}
+
+/**
+ * Push what is staged for one service (docs/decisions/0007), in the background behind the same lock as pulls.
+ * Returns the run ID, or null when another job is running. A push that stops partway is safe to run again: every
+ * playlist is re-read and every write is idempotent.
+ */
+export function startPush(provider: ProviderId, writer: PushWriter): number | null {
+  if (progress.running || !acquire('push')) return null
+  const db = useDb()
+  const name = providerNames[provider]
+  try {
+    const run = db.insert(schema.syncRuns).values({ kind: 'push', provider, trigger: 'manual', startedAt: new Date().toISOString(), status: 'running', attempts: 1, stages: {} }).returning().get()
+    update({ running: true, phase: 'push', message: `Pushing to ${name}`, done: 0, total: 0, error: null, runId: run.id, provider, push: null })
+    const log = createRunLog(run.id, () => update({ rev: progress.rev + 1 }))
+    const start = requestCounts[provider]
+
+    runPush(provider, writer, push => update({ push }), log)
+      .then((counts) => {
+        log.flush()
+        const requests = { [`${provider}Requests`]: requestCounts[provider] - start }
+        db.update(schema.syncRuns).set({ status: 'succeeded', finishedAt: new Date().toISOString(), counts: { ...counts, ...requests } }).where(eq(schema.syncRuns.id, run.id)).run()
+        const summary = `${counts.added} added, ${counts.removed} removed${counts.failed ? `, ${counts.failed} failed and still staged` : ''}${counts.skipped ? `, ${counts.skipped} waiting for playlist creation` : ''}`
+        log.event(counts.failed ? 'warn' : 'info', null, `Finished: ${summary} on ${name}`)
+        update({ running: false, phase: 'done', message: `Pushed to ${name}: ${summary}.` })
+      })
+      .catch((error: Error) => {
+        console.error('[push] failed', error)
+        const stage = log.current()
+        if (stage) log.stage(stage, { status: 'failed', detail: error.message })
+        log.event('error', stage, `Stopped: ${error.message}. What was written is recorded; the rest stays staged, and pushing again re-reads each playlist first`)
+        log.flush()
+        db.update(schema.syncRuns).set({ status: 'failed', finishedAt: new Date().toISOString(), error: error.message, counts: { [`${provider}Requests`]: requestCounts[provider] - start } }).where(eq(schema.syncRuns.id, run.id)).run()
+        // Steps left running stopped with the push.
+        const push = progress.push ? structuredClone(progress.push) : null
+        for (const c of Object.values(push?.collections ?? {})) {
+          for (const s of [c.add, c.remove]) if (s && (s.status === 'running' || s.status === 'waiting')) Object.assign(s, { status: 'failed', detail: s.status === 'running' ? error.message : 'Not attempted: the push stopped' })
+        }
+        update({ running: false, phase: 'failed', message: `The push to ${name} stopped: ${error.message}`, error: error.message, push })
+      })
+      .finally(() => release('push'))
+    return run.id
+  } catch (error) {
+    release('push')
+    throw error
+  }
 }

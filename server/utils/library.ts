@@ -1,6 +1,6 @@
 // The Library page: main compared with each service's last pull, per collection (docs/decisions/0005).
 import { and, desc, eq, inArray, isNull } from 'drizzle-orm'
-import type { CollectionStatusView, LibraryView, ProviderId, RunStatus, StatusCounts, StatusRowView } from '../../shared/types'
+import type { CollectionStatusView, LibraryView, ProviderId, RunStatus, SnapshotItem, StatusCounts, StatusRowView } from '../../shared/types'
 import { PROVIDERS } from '../../shared/types'
 import type { MainEntry } from '../core/pull'
 import { normaliseText } from '../core/normalise'
@@ -16,6 +16,13 @@ export interface CollectionInput {
   links: (typeof schema.collectionLinks.$inferSelect)[]
   holds: (typeof schema.pullHolds.$inferSelect)[]
   input: StatusInput
+}
+
+/** A service holding two releases of one song (docs/decisions/0008) offers it if it offers either. */
+function availability(items: SnapshotItem[]): Map<number, boolean> {
+  const out = new Map<number, boolean>()
+  for (const i of items) out.set(i.canonicalTrackId, out.get(i.canonicalTrackId) || i.available)
+  return out
 }
 
 /** Every collection worth showing, with its status input. */
@@ -40,7 +47,7 @@ export function collectionInputs(): CollectionInput[] {
     if (!main.size && !holds.length && !PROVIDERS.some(followedOn)) continue
     const sides = Object.fromEntries(PROVIDERS.map((p) => {
       const snap = snapshots.find(s => s.provider === p && s.collectionId === c.id)
-      return [p, { pulled: pulled[p], items: snap ? new Map(snap.items.map(i => [i.canonicalTrackId, i.available])) : null, followed: followedOn(p) }]
+      return [p, { pulled: pulled[p], items: snap ? availability(snap.items) : null, followed: followedOn(p) }]
     })) as StatusInput['sides']
     const picked = new Map<number, Partial<Record<ProviderId, Change>>>()
     for (const s of staged.filter(x => x.collectionId === c.id)) picked.set(s.canonicalTrackId, { ...picked.get(s.canonicalTrackId), [s.provider]: s.change })
@@ -111,7 +118,7 @@ export function libraryView(selectedKey?: string): LibraryView {
       return {
         canonicalTrackId: r.canonicalTrackId,
         state: rowState(r),
-        track: { title: t?.title ?? 'Unknown', artists: t?.artists ?? [], durationMs: t?.durationMs ?? 0, isrc: t?.isrc ?? null },
+        track: { title: t?.title || 'Unknown song', artists: t?.artists ?? [], durationMs: t?.durationMs ?? 0, isrc: t?.isrc ?? null },
         main: r.main,
         spotify: r.spotify,
         tidal: r.tidal,

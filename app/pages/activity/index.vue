@@ -15,7 +15,7 @@ const total = (r: RunSummary, k: string) => (r.counts?.[k] ?? 0).toLocaleString(
   <main class="page">
     <AppHeader :connections="connections ?? []" />
     <h1 class="display title">Activity</h1>
-    <p class="muted intro">Every pull and cleanup, newest first. A pull only reads one service and updates main. Entries marked <strong>Wrote to Tidal</strong> changed your Tidal library.</p>
+    <p class="muted intro">Every pull, push and cleanup, newest first. A pull only reads one service and updates main. Entries marked <strong>Wrote to</strong> changed that service's library.</p>
 
     <p v-if="!runs?.length" class="muted">Nothing yet.</p>
     <div class="list">
@@ -23,7 +23,7 @@ const total = (r: RunSummary, k: string) => (r.counts?.[k] ?? 0).toLocaleString(
         <div class="run-head">
           <span class="display run-id"><ServiceIcon v-if="r.provider" :provider="r.provider" :size="16" /> {{ runTitle(r) }} #{{ r.id }}</span>
           <span class="pill small" :class="runStatusPill[r.status].cls">{{ runStatusPill[r.status].label }}</span>
-          <span v-if="r.kind === 'cleanup'" class="pill small solid-coral">− Wrote to Tidal</span>
+          <span v-if="r.kind === 'cleanup' || r.kind === 'push'" class="pill small solid-coral">− Wrote to {{ r.provider === 'spotify' ? 'Spotify' : 'Tidal' }}</span>
           <span class="mono muted when">{{ formatWhen(r.startedAt) }} · {{ r.trigger === 'schedule' ? 'automatic' : 'manual' }}<template v-if="r.attempts > 1"> · {{ r.attempts }} attempts</template></span>
         </div>
         <div class="stages" aria-hidden="true">
@@ -37,6 +37,12 @@ const total = (r: RunSummary, k: string) => (r.counts?.[k] ?? 0).toLocaleString(
             <span>{{ total(r, 'removed') }} removed</span>
             <span>{{ total(r, 'conflicts') }} conflicts</span>
             <span>{{ total(r, 'held') }} held</span>
+          </template>
+          <template v-else-if="r.kind === 'push'">
+            <span>{{ total(r, 'added') }} added</span>
+            <span>{{ total(r, 'removed') }} removed</span>
+            <span>{{ total(r, 'failed') }} failed</span>
+            <span>{{ total(r, 'skipped') }} waiting</span>
           </template>
           <template v-else-if="r.kind === 'cleanup'">
             <span>{{ total(r, 'merged') }} merged</span>

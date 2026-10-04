@@ -6,7 +6,8 @@ import { eq } from 'drizzle-orm'
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import type { LibraryView, PlaylistAccess, ProviderId, ProviderTrack } from '../shared/types'
 import { ProviderError, QuotaError } from '../server/providers/http'
-import type { MusicProvider } from '../server/providers/types'
+import type { MusicProvider, PlaylistEntry, PushWriter } from '../server/providers/types'
+import type { RunLog } from '../server/jobs/run-log'
 
 type Db = typeof import('../server/utils/db')
 let db: ReturnType<Db['useDb']>
@@ -16,6 +17,7 @@ let libraryView: typeof import('../server/utils/library').libraryView
 let decisions: typeof import('../server/jobs/decisions')
 let cleanup: typeof import('../server/jobs/cleanup')
 let staging: typeof import('../server/utils/staging')
+let runPush: typeof import('../server/jobs/push').runPush
 
 const t = (id: string, isrc: string | null, over: Partial<ProviderTrack> = {}): ProviderTrack =>
   ({ providerTrackId: id, isrc, title: `Song ${isrc ?? id}`, artists: ['Artist'], album: 'Album', durationMs: 200_000, explicit: false, version: null, ...over })
@@ -81,6 +83,7 @@ beforeAll(async () => {
   decisions = await import('../server/jobs/decisions')
   cleanup = await import('../server/jobs/cleanup')
   staging = await import('../server/utils/staging')
+  runPush = (await import('../server/jobs/push')).runPush
 })
 
 describe('pull into main', () => {
@@ -151,6 +154,45 @@ describe('pull into main', () => {
     await pullOf('tidal')
     const again = await pullOf('tidal')
     expect(again.counts).toMatchObject({ added: 0, removed: 0, confirmed: 0, conflicts: 0, held: 0 })
+  })
+
+  describe('metadata matching (decision 0008)', () => {
+    const always = (id: string, isrc: string, album: string, over: Partial<ProviderTrack> = {}) => t(id, isrc, { title: 'Always', artists: ['Gavin James'], album, ...over })
+
+    it('joins the same song with a different ISRC on each service, and the next pull finds nothing new', async () => {
+      libraries.spotify = { liked: [], playlists: { sp: { name: 'Alt Tunes', tracks: [always('s-single', 'SINGLE', 'Always')] } } }
+      libraries.tidal = { liked: [], playlists: { tp: { name: 'Alt Tunes', tracks: [always('t-album', 'ALBUM', 'Form & Function', { title: 'Always', durationMs: 201_000 })] } } }
+      await pullOf('spotify')
+      await pullOf('tidal')
+      expect(rowsOf('Alt Tunes').map(r => r.state)).toEqual(['in_sync'])
+      expect(db.select().from(schema.canonicalTracks).all()).toHaveLength(1)
+      expect(db.select().from(schema.trackLinks).all().map(l => `${l.providerTrackId}:${l.method}`).sort()).toEqual(['s-single:origin', 't-album:metadata'])
+      const again = await pullOf('tidal')
+      expect(again.counts).toMatchObject({ added: 0, removed: 0, confirmed: 0, conflicts: 0, held: 0 })
+      expect((await pullOf('spotify')).counts).toMatchObject({ added: 0, removed: 0, conflicts: 0 })
+    })
+
+    it('joins a single and an album release that are each already linked on both services', async () => {
+      // Liked songs link each release on both services by ISRC; the playlists hold a different release on each.
+      libraries.spotify = { liked: [always('s-album', 'ALBUM', 'Form & Function')], playlists: { sp: { name: 'Alt Tunes', tracks: [always('s-single', 'SINGLE', 'Always')] } } }
+      libraries.tidal = { liked: [always('t-single', 'SINGLE', 'Always')], playlists: { tp: { name: 'Alt Tunes', tracks: [always('t-album', 'ALBUM', 'Form & Function')] } } }
+      await pullOf('tidal')
+      await pullOf('spotify')
+      expect(rowsOf('Alt Tunes').map(r => r.state)).toEqual(['in_sync'])
+      expect(rowsOf('Liked songs').map(r => r.state)).toEqual(['in_sync'])
+      expect(libraryView().totals.add).toEqual({ spotify: 0, tidal: 0 })
+      expect((await pullOf('tidal')).counts).toMatchObject({ added: 0, removed: 0, confirmed: 0, conflicts: 0 })
+    })
+
+    it('does not join a live version, or two copies only one service holds', async () => {
+      libraries.spotify = { liked: [always('s1', 'STUDIO', 'Always')], playlists: {} }
+      libraries.tidal = { liked: [always('t1', 'LIVE', 'Always', { version: 'Live' }), always('t2', 'DEMO', 'Demos'), always('t3', 'RERECORD', 'Again')], playlists: {} }
+      await pullOf('tidal')
+      expect(db.select().from(schema.canonicalTracks).all()).toHaveLength(3)
+      await pullOf('spotify')
+      // Two Tidal copies could each be the Spotify song, so none of them joins; the live one never matches.
+      expect(states('Liked songs')).toEqual({ STUDIO: 'present/missing', LIVE: 'missing/present', DEMO: 'missing/present', RERECORD: 'missing/present' })
+    })
   })
 
   it('a song removed on Spotify leaves main, and Tidal shows it to remove', async () => {
@@ -338,6 +380,147 @@ describe('pull into main', () => {
       expect(rowsOf('Liked songs').some(r => r.track.isrc === 'ISRC1')).toBe(false)
       expect(libraryView().totals.staged.add.tidal).toBe(0)
       expect(staging.pruneStaged()).toBe(1)
+    })
+  })
+  describe('push to Tidal (decision 0007, slice 2)', () => {
+    const key = (name: string) => Number(collection(libraryView(), name).key)
+    /** ISRCs Tidal will not find, and track IDs it refuses to add. */
+    let missingOnTidal = new Set<string>()
+    let refused = new Set<string>()
+    let writes: string[] = []
+    const quietLog: RunLog = { stage: () => {}, event: () => {}, current: () => null, flush: () => {} }
+
+    function fakeWriter(): PushWriter {
+      const lib = libraries.tidal
+      const byId = (id: string) => T(Number(id.slice(1)))
+      return {
+        id: 'tidal',
+        findPlayableByIsrcs: async isrcs => new Map(isrcs.filter(i => !missingOnTidal.has(i)).map(i => [i, `t${i.replace('ISRC', '')}`])),
+        readPlaylist: async (pid) => {
+          const p = lib.playlists[pid]
+          return p ? p.tracks.map((t, n): PlaylistEntry => ({ trackId: t.providerTrackId, entryId: `${pid}-${n}`, isrc: t.isrc })) : null
+        },
+        addToPlaylist: async (pid, ids) => {
+          writes.push(`add ${pid} ${ids.join(',')}`)
+          const ok = ids.filter(id => !refused.has(id))
+          lib.playlists[pid]!.tracks.push(...ok.map(byId))
+          return new Map(ids.filter(id => refused.has(id)).map(id => [id, 'Tidal would not add it: not available']))
+        },
+        removeFromPlaylist: async (pid, entries) => {
+          writes.push(`remove ${pid} ${entries.map(e => e.trackId).join(',')}`)
+          const gone = new Set(entries.map(e => e.trackId))
+          lib.playlists[pid]!.tracks = lib.playlists[pid]!.tracks.filter(t => !gone.has(t.providerTrackId))
+          return new Map()
+        },
+        addLiked: async (ids) => {
+          writes.push(`like ${ids.join(',')}`)
+          lib.liked.push(...ids.filter(id => !lib.liked.some(t => t.providerTrackId === id)).map(byId))
+          return new Map()
+        },
+        removeLiked: async (ids) => {
+          writes.push(`unlike ${ids.join(',')}`)
+          lib.liked = lib.liked.filter(t => !ids.includes(t.providerTrackId))
+          return new Map()
+        },
+      }
+    }
+    const push = () => runPush('tidal', fakeWriter(), () => {}, quietLog)
+
+    beforeEach(() => { missingOnTidal = new Set(); refused = new Set(); writes = [] })
+
+    it('writes only what is staged, then status, the stage and the next pull all agree', async () => {
+      await pullOf('spotify')
+      await pullOf('tidal')
+      staging.setStaged({ provider: 'tidal' }, true)
+      // Staged for Spotify too, but a Tidal push leaves it alone.
+      staging.setStaged({ provider: 'spotify', collectionId: key('Liked songs') }, true)
+
+      expect(await push()).toEqual({ added: 2, removed: 0, failed: 0, skipped: 0 })
+      expect(writes).toEqual(['like t1', 'add tp1 t2'])
+      expect(libraries.tidal.liked.map(t => t.isrc)).toContain('ISRC1')
+      expect(libraries.tidal.playlists.tp1!.tracks.map(t => t.isrc)).toEqual(['ISRC1', 'ISRC2'])
+
+      expect(states('Liked songs')).toEqual({ ISRC4: 'missing/present' })
+      expect(states('Night Drive')).toEqual({})
+      expect(db.select().from(schema.stagedChanges).all().map(r => r.provider)).toEqual(['spotify'])
+      const again = await pullOf('tidal')
+      expect(again.counts).toMatchObject({ added: 0, removed: 0, conflicts: 0, held: 0 })
+    })
+
+    it('pushes a removal from main to the Tidal playlist', async () => {
+      libraries.tidal.playlists.tp1!.tracks = [T(1), T(2)]
+      await pullOf('spotify')
+      await pullOf('tidal')
+      libraries.spotify.playlists.sp1!.tracks = [S(1)]
+      await pullOf('spotify')
+      expect(states('Night Drive')).toEqual({ ISRC2: 'absent/extra' })
+      staging.setStaged({ provider: 'tidal', collectionId: key('Night Drive') }, true)
+
+      expect(await push()).toMatchObject({ removed: 1, failed: 0 })
+      expect(writes).toEqual(['remove tp1 t2'])
+      expect(states('Night Drive')).toEqual({})
+      expect((await pullOf('tidal')).counts).toMatchObject({ added: 0, removed: 0 })
+    })
+
+    it('a song Tidal does not have stays staged with the reason, and goes once Tidal has it', async () => {
+      // Song 2 is in Tidal's liked songs, so its Tidal ID is known; song 9 Tidal has never had.
+      libraries.spotify.playlists.sp1!.tracks = [S(1), S(2), S(9)]
+      await pullOf('spotify')
+      await pullOf('tidal')
+      staging.setStaged({ provider: 'tidal', collectionId: key('Night Drive') }, true)
+      missingOnTidal = new Set(['ISRC9'])
+
+      expect(await push()).toMatchObject({ added: 1, failed: 1 })
+      expect(writes).toEqual(['add tp1 t2'])
+      expect(db.select().from(schema.stagedChanges).all()).toMatchObject([{ lastError: 'Not found on Tidal by ISRC ISRC9', attempts: 1 }])
+      expect(staging.stagedView().tidal.collections[0]!.add).toMatchObject([{ isrc: 'ISRC9', error: 'Not found on Tidal by ISRC ISRC9', attempts: 1 }])
+      await push()
+      expect(db.select().from(schema.stagedChanges).all()).toMatchObject([{ attempts: 2 }])
+
+      missingOnTidal = new Set()
+      expect(await push()).toMatchObject({ added: 1, failed: 0 })
+      expect(db.select().from(schema.stagedChanges).all()).toEqual([])
+      expect(states('Night Drive')).toEqual({})
+    })
+
+    it('a song Tidal refuses to add is a failure on that song only', async () => {
+      libraries.spotify.playlists.sp1!.tracks = [S(1), S(2), S(3)]
+      await pullOf('spotify')
+      await pullOf('tidal')
+      staging.setStaged({ provider: 'tidal', collectionId: key('Night Drive') }, true)
+      refused = new Set(['t3'])
+      expect(await push()).toMatchObject({ added: 1, failed: 1 })
+      expect(states('Night Drive')).toEqual({ ISRC3: 'present/missing' })
+      expect(db.select().from(schema.stagedChanges).all()).toMatchObject([{ lastError: 'Tidal would not add it: not available' }])
+    })
+
+    it('does not write a song already in the playlist under any ID', async () => {
+      await pullOf('spotify')
+      await pullOf('tidal')
+      staging.setStaged({ provider: 'tidal', collectionId: key('Night Drive') }, true)
+      // Song 2 reached the Tidal playlist since the last pull, as a different release.
+      libraries.tidal.playlists.tp1!.tracks.push(t('t2b', 'ISRC2'))
+      expect(await push()).toMatchObject({ added: 1, failed: 0 })
+      expect(writes).toEqual([])
+    })
+
+    it('leaves a playlist Tidal does not have yet staged, without an error', async () => {
+      libraries.spotify.playlists.sp9 = { name: 'Road Trip', tracks: [S(8)] }
+      await pullOf('spotify')
+      await pullOf('tidal')
+      staging.setStaged({ provider: 'tidal', collectionId: key('Road Trip') }, true)
+      expect(await push()).toMatchObject({ added: 0, skipped: 1, failed: 0 })
+      expect(writes).toEqual([])
+      expect(db.select().from(schema.stagedChanges).all()).toMatchObject([{ lastError: null, attempts: 0 }])
+    })
+
+    it('fails a playlist deleted on Tidal since the last pull, and keeps it staged', async () => {
+      await pullOf('spotify')
+      await pullOf('tidal')
+      staging.setStaged({ provider: 'tidal', collectionId: key('Night Drive') }, true)
+      delete libraries.tidal.playlists.tp1
+      expect(await push()).toMatchObject({ failed: 1 })
+      expect(db.select().from(schema.stagedChanges).all()[0]!.lastError).toMatch(/no longer on Tidal/)
     })
   })
 })

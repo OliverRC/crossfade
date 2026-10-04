@@ -13,7 +13,7 @@ The library is small (hundreds to low thousands of songs per service), so correc
 Guiding principles:
 
 - Never surprise the user. Pull only reads a service and updates main. Push is the only thing that writes to a service, and it always shows its changes first.
-- Hard-match first: ISRC before anything fuzzy, because a wrong link is worse than a missing one.
+- Hard-match first: ISRC, then exact metadata across services (`0008`), before anything fuzzy, because a wrong link is worse than a missing one.
 - Remember human decisions: a confirmed match, a staged change, a resolved conflict is stored and never asked again.
 - State, not events: failures, unmatched songs and holds are states on the item, and they clear themselves once resolved.
 - Simple over clever: full snapshots, in-memory diffing, one SQLite file, one container.
@@ -94,7 +94,7 @@ Main is canonical songs, collections and memberships. Each service has links to 
 
 | Table | Purpose |
 | --- | --- |
-| `canonical_tracks` | One real recording: isrc, title, artists, album, durationMs |
+| `canonical_tracks` | One real recording: isrc, title, version (Tidal's tag), artists, album, durationMs |
 | `track_links` | A service's copy of a canonical song: providerTrackId (null when unmatched), status (matched, unmatched, review, ignored), method (origin, isrc, fuzzy, manual), confidence, unmatchedReason, review candidate, isPreferred |
 | `collections` | Liked songs, or one playlist: kind, name |
 | `collection_links` | A service's copy of a collection: providerCollectionId (null for liked), access (owned, collaborative, followed), ownerName |
@@ -223,7 +223,7 @@ Tidal playlist cleanup (`0004`) writes to Tidal directly today, like `git gc`. O
 
 ## Matching
 
-Matching happens at push time, because only then is a song's ID on the target service needed. Pull compares ISRCs in memory, which is free.
+Matching happens at push time, because only then is a song's ID on the target service needed. Pull compares ISRCs in memory, which is free, then joins songs whose cleaned-up title, artists and version are equal and whose lengths are within 2 seconds, across services only (method `metadata`, `0008`).
 
 1. Existing link: use it. Links with method `manual` are never re-evaluated.
 2. ISRC lookup on the target. Several results (the same recording on different releases): prefer the same album title, then the same explicit flag, then the closest duration.
@@ -312,7 +312,7 @@ Work one milestone at a time and stop at each "Done when" for Oliver to verify. 
 | V0 Login, connections, read adapters, dry-run diff | Done. Its dry-run sync was replaced by pull |
 | Tidal playlist cleanup | Done (`0004`) |
 | **M4 Main and pull** | **In progress**: pull, conflicts, holds, status and the Library page work; awaiting Oliver's check on the real library |
-| **M5 Push** | **In progress**: slice 1 (staging) built; push to Tidal next |
+| **M5 Push** | **In progress**: staging and push to Tidal built; first real push to Tidal waiting for Oliver; push to Spotify next |
 | M3 Manual search and review | After M5 |
 | Docker and Unraid | Whenever deployment is wanted |
 | M6 Automation | Phase 2 |
@@ -333,7 +333,7 @@ Done when: pulling Tidal then Spotify builds a main Oliver agrees with, the Libr
 Built in slices (`0007`):
 
 - [x] Staging: per-song, per-collection and per-service staging, and the Staged page as the push preview.
-- [ ] Push to Tidal, tried on the test playlist first.
+- [x] Push to Tidal: ISRC lookup, playlists re-read before writing, idempotent liked-song writes, per-song results and failure states (`0007`). First real push to be tried on a test playlist.
 - [ ] Push to Spotify: ID lookup at push time, rationed, paused and resumed on quota.
 - [ ] Fresh read before writing, per-song results, retries and failure states.
 - [ ] Creating playlists on the other service.

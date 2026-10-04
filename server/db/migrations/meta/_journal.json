@@ -64,6 +64,27 @@
       "when": 1791140824887,
       "tag": "0008_staged_changes",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1791142130914,
+      "tag": "0009_staged_failures",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1791142952497,
+      "tag": "0010_canonical_version",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1791142994533,
+      "tag": "0011_backfill_canonical_version",
+      "breakpoints": true
     }
   ]
 }

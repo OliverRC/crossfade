@@ -19,7 +19,8 @@ const selected = computed<CollectionStatusView | undefined>(() => collections.va
 const rows = computed(() => (library.value?.selected?.rows ?? []).filter(r => showAll.value || (r.state !== 'in_sync' && r.state !== 'unknown')))
 const hiddenUnknown = computed(() => showAll.value ? 0 : (library.value?.selected?.rows ?? []).filter(r => r.state === 'unknown').length)
 const running = computed(() => progress.value?.running ?? false)
-const pulling = (p: ProviderId) => running.value && progress.value?.provider === p
+const pulling = (p: ProviderId) => running.value && progress.value?.provider === p && progress.value?.phase !== 'push'
+const pushingTo = (p: ProviderId) => running.value && progress.value?.provider === p && progress.value?.phase === 'push'
 const anyPulled = computed(() => PROVIDERS.some(p => library.value?.services[p].pulledAt))
 /** A service with no pull yet: until it has one, "only on one service" and "synced" mean nothing. */
 const unpulled = computed(() => PROVIDERS.filter(p => !library.value?.services[p].pulledAt))
@@ -77,7 +78,12 @@ function presence(c: CollectionStatusView | undefined, p: ProviderId): { glyph: 
   return { glyph: '✗', text: names[p], dim: true, label: `Not on ${names[p]}` }
 }
 /** Services a push would change for this collection; followed copies are never pushed. */
-const planned = (c: CollectionStatusView | undefined) => c ? PROVIDERS.filter(p => waiting(c.counts)[p] > 0 && c.shared[p]?.access !== 'followed') : []
+/** The running or last push's steps for this collection on one service. */
+const pushProgress = (c: CollectionStatusView | undefined, p: ProviderId) => c && progress.value?.push?.provider === p ? progress.value.push.collections[c.key] : undefined
+/** Services a push would change for this collection, or just changed; followed copies are never pushed. */
+const planned = (c: CollectionStatusView | undefined) => c
+  ? PROVIDERS.filter(p => (waiting(c.counts)[p] > 0 || pushProgress(c, p)) && c.shared[p]?.access !== 'followed')
+  : []
 const plural = (n: number, word: string) => `${n.toLocaleString('en-GB')} ${word}${n === 1 ? '' : 's'}`
 const fmtDuration = (ms: number) => `${Math.floor(ms / 60000)}:${String(Math.round((ms % 60000) / 1000)).padStart(2, '0')}`
 
@@ -172,6 +178,9 @@ const mainMark = (row: StatusRowView): Mark => row.main === 'active'
     <AppHeader :connections="connections ?? []" />
 
     <div v-if="actionError" class="banner error" role="alert">{{ actionError }}</div>
+    <div v-if="!running && progress?.push && progress.runId" class="banner" :class="progress.phase === 'failed' ? 'error' : 'ok'" role="status">
+      {{ progress.message }} <NuxtLink :to="`/activity/${progress.runId}`">See what it did</NuxtLink>
+    </div>
     <template v-for="p in PROVIDERS" :key="p">
       <div v-if="!running && library?.services[p].run?.status === 'failed'" class="banner error" role="alert">
         The last {{ names[p] }} pull stopped: {{ library.services[p].run!.error }}. Everything it fetched is saved; pull again to resume.
@@ -212,7 +221,7 @@ const mainMark = (row: StatusRowView): Mark => row.main === 'active'
         </div>
         <PushPlan
           v-for="p in planned(selected)" :key="`plan-${p}`" :provider="p" :collection="selected!"
-          :creates-playlist="missingOn(selected).includes(p)" :namesake="missingOn(selected).includes(p) ? namesakeOn(selected, p) : undefined" :disabled="running"
+          :creates-playlist="missingOn(selected).includes(p)" :progress="pushProgress(selected, p)" :namesake="missingOn(selected).includes(p) ? namesakeOn(selected, p) : undefined" :disabled="running"
           @stage="(change, staged) => stage({ collection: selected!.key, provider: p, change }, staged)" @show="key => selectedKey = key"
         />
         <div class="hero-foot">
@@ -236,6 +245,7 @@ const mainMark = (row: StatusRowView): Mark => row.main === 'active'
             <div class="service-name">{{ names[p] }}</div>
             <div class="mono service-meta">
               <template v-if="pulling(p)">{{ progress?.message }}<span v-if="progress?.total"> · {{ progress.done }}/{{ progress.total }}</span></template>
+              <template v-else-if="pushingTo(p)">Pushing staged changes…</template>
               <template v-else-if="library?.services[p].pulledAt">pulled {{ formatWhen(library.services[p].pulledAt!) }} · {{ plural(waiting(library.totals)[p], 'change') }} to push<template v-if="stagedCount(library.totals)[p]">, {{ stagedCount(library.totals)[p].toLocaleString('en-GB') }} staged</template></template>
               <template v-else>never pulled</template>
             </div>
