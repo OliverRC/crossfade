@@ -1,309 +1,257 @@
-# Crossfade — Claude Code Handoff Plan
+# Crossfade plan
 
-Oct 1, 2026 · @Oliver and Niki
+Oct 1, 2026 · @Oliver and Niki · Revised Oct 4, 2026
+
+This is the living plan. It was first written as a Claude Code handoff (commit `ede371b`) around Sync, a queue and Apply. Building V0 against the real libraries changed the shape: Crossfade now follows git's model of a local main and two remotes, with pull and push as separate steps. Each change is explained in `docs/decisions/`; this document states where the design stands now.
 
 ## Overview
 
-Build Crossfade, a self-hosted web app that keeps a personal Spotify library and Tidal library in sync both ways, through a side-by-side diff view in the spirit of Sonarr and Radarr. Neither service is the master: the app owns its own canonical library, and Spotify and Tidal are two equal primaries it reads from and writes to.
+Crossfade is a self-hosted web app that keeps one person's Spotify and Tidal libraries in sync both ways, through a side-by-side diff in the spirit of Sonarr and Radarr. Neither service is the master. The app holds its own canonical library, **main**, and Spotify and Tidal are two equal remotes it pulls from and pushes to.
 
-The library is small (hundreds to low thousands of tracks), so correctness and transparency matter far more than performance. Existing SaaS tools behave like one-off migrations; this tool is built for ongoing sync.
+The library is small (hundreds to low thousands of songs per service), so correctness and transparency matter far more than speed. Existing SaaS tools behave like one-off migrations; this tool is built for ongoing sync.
 
 Guiding principles:
 
-- Never surprise the user: Sync only plans. Every change lands in a queue, and nothing is written until the user applies it.
+- Never surprise the user. Pull only reads a service and updates main. Push is the only thing that writes to a service, and it always shows its changes first.
 - Hard-match first: ISRC before anything fuzzy, because a wrong link is worse than a missing one.
-- Remember human decisions: a confirmed or overridden match is stored and never re-litigated.
-- State, not events: failures and unmatched tracks are states on the item, and they clear themselves once resolved.
+- Remember human decisions: a confirmed match, a held-back change, a resolved conflict is stored and never asked again.
+- State, not events: failures, unmatched songs and holds are states on the item, and they clear themselves once resolved.
 - Simple over clever: full snapshots, in-memory diffing, one SQLite file, one container.
+
+## The model: main, pull and push
+
+Reading and writing have different costs and risks. Reading Tidal costs nothing scarce; Spotify lookups are rationed by an unpublished quota; writes change a real library. So they are separate steps, named after git (`docs/decisions/0005`). It stays a web app: git shapes the model and the words, not a command line.
+
+| git | Crossfade |
+| --- | --- |
+| `main` | The canonical library: every song, which collections it belongs in, and its state on each service |
+| remotes | `spotify` and `tidal`, equal peers; neither is the origin |
+| remote-tracking branch | Each service's snapshot from its last pull |
+| `pull spotify` | Read Spotify, work out what changed since its last snapshot, apply that to main. Never writes to a service |
+| `push tidal` | Make Tidal match main: preview the adds and removals, then write them when Oliver presses Push |
+| `status` | Per collection and service: what the service is missing compared with main |
+| merge conflict | A pull that would undo a newer change in main stops on that song and asks |
+| `--force-with-lease` | Push re-reads the collection before writing and writes only what is still needed |
+| `log` | The Activity page: every pull, push and cleanup with what it changed |
+
+Pull Spotify, pull Tidal, push Spotify and push Tidal are four separate actions. A one-press sync (pull both, push both) waits until pull and push have earned trust on the real library.
 
 ## Scope
 
-The MVP keeps liked songs and owned playlists in step between Spotify and Tidal: Sync builds a queue of changes, the user edits it, and Apply writes what is left queued.
-
 MVP:
 
-- Liked songs (Spotify Saved Tracks, Tidal collection tracks), synced as a set.
-- Playlists the user owns on either side, synced as sets of tracks; ordering is ignored. A playlist that exists on one side only can be created on the other.
-- One-time bootstrap reconciliation that seeds the canonical store from current state.
-- Automatic ISRC matching, fuzzy fallback with a confidence score, and a manual search override.
-- Unmatched tracks recorded with a reason, not dropped.
-- Per-item failure state that clears on a successful retry.
-- A Sync button that only plans, a queue the user can edit item by item, and an Apply button that writes what is queued.
+- Liked songs (Spotify saved tracks, Tidal collection tracks), synced as a set.
+- Playlists synced as sets of songs; ordering is ignored. A playlist on one side only can be created on the other by push.
+  - Owned playlists, as planned.
+  - Collaborative playlists owned by someone else are read and pushed like owned ones (`0006`).
+  - Followed playlists owned by someone else are listed and paired by name so their copies on the other service are not treated as missing, but they are never read or pushed: Spotify returns 403 for their items (`0006`).
+- Pull per service, with snapshots, conflicts, and a sanity guard against bad reads.
+- Push per service, with a preview, hold-back, ISRC lookup at push time, a fresh read before writing, and per-song results.
+- Automatic ISRC matching; fuzzy candidates proposed for review; a manual search override.
+- Unmatched songs recorded with a reason, not dropped. Songs a service no longer offers stay in main, marked unavailable there.
+- Tidal playlist cleanup: merge exact duplicate copies and remove empty playlists, confirmed on the Cleanup page (`0004`).
 
 Phase 2:
 
-- Scheduled sync that refreshes the queue on a timer; it still never writes. Auto-applying ISRC-matched adds could be a later opt-in.
-- Periodic re-check of unmatched tracks, surfacing newly available ones as pending actions.
+- Sync: pull both, then push both, as one press.
+- Scheduled pulls (safe, since a pull never writes).
+- Periodic re-check of unmatched and pulled songs, re-adding them when a service brings them back.
 
 Stretch:
 
 - Followed artists and saved albums, using the same canonical-entity pattern (albums matched by UPC).
+- Tidal collaborative playlists (`filter[collaborators.id]=me`).
 
 Non-goals:
 
 - Play counts and listening history.
 - Playlist ordering.
-- Playlists owned by other people (followed or editorial).
+- Reading or writing playlists owned by someone else that the user only follows.
 - Multiple users. The adapter interface should still allow a third service later.
 
 ## Architecture and stack
 
-One Nuxt app in one container holds the Vue UI, Nitro server routes, a pure TypeScript sync core, two provider adapters and a SQLite canonical store.
+One Nuxt app in one container holds the Vue UI, Nitro server routes, a pure TypeScript core, two provider adapters and a SQLite store.
 
-&#91;embedded content: architecture · one container, two adapters, one canonical store\]
-
-Adapters are the only code that talks to Spotify or Tidal. The engine works on snapshots and writes its plan to the store, so it can be tested without any network. A sync runs in-process behind a lock, never inside a request handler, and the UI follows it over server-sent events.
+Adapters are the only code that talks to Spotify or Tidal. `server/core` (pull merge, status, matching scores, duplicate detection) is pure functions over snapshots, so it can be tested without any network. Pulls and cleanups run in-process behind one lock, never inside a request handler, and the UI follows them over server-sent events.
 
 | Layer | Choice | Why |
 | --- | --- | --- |
 | App framework | Nuxt (Vue 3, TypeScript), Nitro server routes for the API | Oliver's recent stack; UI and API in one project with shared types |
-| Storage | SQLite via Drizzle ORM and its migrations | One file; a few thousand tracks fit easily |
-| App login | `nuxt-auth-utils` sealed cookie session | Fits a single username and password |
+| Storage | SQLite via Drizzle ORM and its migrations (applied on server start) | One file; a few thousand songs fit easily |
+| App login | `nuxt-auth-utils` sealed cookie session, scrypt password hash | Fits a single username and password |
 | Token encryption | Node `crypto`, AES-256-GCM, key from an env var | Built in |
-| Background work | In-process runner with a lock; Nitro scheduled tasks or a small cron library in phase 2 | No external queue needed |
+| Background work | In-process runner with one lock; checkpointed, resumable runs | No external queue needed |
 | Live progress | Server-sent events via h3 | One-way, simpler than WebSockets |
 | Tests | Vitest | Native to the Vite toolchain |
-| Packaging | One Docker image running the Nitro build on Node LTS | Unraid-native |
-
-.NET was the alternative. Both are familiar, but Nuxt covers UI and API in one language with shared types, so the familiar stack wins.
+| Packaging | One Docker image running the Nitro build on Node 24 | Unraid-native |
 
 ## Data model
 
-The canonical store holds one record per real-world track and playlist, with provider IDs hanging off it, plus a per-provider snapshot that acts as the baseline for the next diff.
+Main is canonical songs, collections and memberships. Each service has links to them and a snapshot per collection.
 
-| Entity | Purpose | Key fields |
-| --- | --- | --- |
-| CanonicalTrack | One real recording | id, isrc, title, artists, album, durationMs, createdAt |
-| TrackLink | A provider's copy of a canonical track | canonicalTrackId, provider, providerTrackId (null when unmatched), status (matched / unmatched / ignored), method (isrc / fuzzy / manual), confidence, unmatchedReason, isPreferred, lastCheckedAt |
-| Collection | Liked songs, or one playlist | id, kind (liked / playlist), name |
-| CollectionLink | A provider's copy of a collection | collectionId, provider, providerCollectionId (null for liked), isOwned |
-| Membership | Canonical "this track belongs here" | collectionId, canonicalTrackId, state (active / removed), changedAt, changedBy (sync / user) |
-| Snapshot | Last-synced state of one collection on one provider | provider, collectionId, takenAt, providerTrackIds (set) |
-| PendingAction | One change in the queue | id, syncRunId, collectionId, canonicalTrackId, provider, kind (add / remove / createPlaylist / linkReview), status (queued / dequeued / running / succeeded / failed / obsolete), userSet (true when the user queued or dequeued it), attempts, lastError, lastAttemptAt |
-| SyncRun | One sync (plan) or one apply | id, kind (sync / apply), trigger (manual / schedule), startedAt, finishedAt, counts |
-| ProviderAccount | OAuth tokens for one service | provider, providerUserId, accessToken and refreshToken (encrypted), expiresAt, scopes |
+| Table | Purpose |
+| --- | --- |
+| `canonical_tracks` | One real recording: isrc, title, artists, album, durationMs |
+| `track_links` | A service's copy of a canonical song: providerTrackId (null when unmatched), status (matched, unmatched, review, ignored), method (origin, isrc, fuzzy, manual), confidence, unmatchedReason, review candidate, isPreferred |
+| `collections` | Liked songs, or one playlist: kind, name |
+| `collection_links` | A service's copy of a collection: providerCollectionId (null for liked), access (owned, collaborative, followed), ownerName |
+| `memberships` | **Main.** A song belongs in a collection (active) or was removed (a tombstone): changedAt, changedBy (a service or user) |
+| `snapshots` | What a service held in one collection at its last pull: the base its next pull compares against |
+| `conflicts` | A pull that would undo a newer change in main, awaiting Oliver: keep or remove |
+| `pull_holds` | A collection a pull did not merge: came back empty, would lose too many songs, or is gone from the service |
+| `sync_runs`, `fetch_checkpoints`, `sync_events` | Checkpointed runs (pull, cleanup), their saved reads, and the Activity log |
+| `unavailable_items` | Songs a service lists but will not play, remembered against the playlist |
+| `playlist_backups` | Playlists removed by cleanup: name, description, access, items |
+| `provider_accounts` | OAuth tokens for one service, encrypted, with quota pause state |
 
-Rules the schema must enforce:
+Rules the schema enforces:
 
-- (provider, providerTrackId) is unique: a provider track maps to exactly one canonical track.
-- A canonical track may have several provider IDs on one service (the same recording on two albums); one is marked isPreferred and used for writes.
-- Unmatched tracks keep a TrackLink row with a null providerTrackId, so "seen on Spotify, not on Tidal" is queryable.
-- Removed memberships are kept as tombstones, so a stale snapshot can never silently re-add a deliberately removed track.
-- All timestamps in UTC.
+- (provider, providerTrackId) is unique: a service's song maps to exactly one canonical song.
+- A canonical song may have several IDs on one service (the same recording on two albums); one is preferred and used for writes.
+- Removed memberships are kept as tombstones, so a stale read can never silently re-add a deliberately removed song.
+- All timestamps are UTC.
 
 ## Auth and provider adapters
 
-Both services allow a personal app to read and write a user's library over OAuth, but Spotify reshaped its API in February 2026, so code must target the new endpoints rather than older SDKs or examples.
+Spotify reshaped its Web API in February and March 2026, and Tidal's v2 API differs from older examples, so code targets the current endpoints and is checked against the changelogs and the published spec. The verified endpoint facts are kept in `CLAUDE.md`.
 
 ### App login
 
 - One username and a password hash, both from environment variables. No user table, no reset flow.
-- Sealed cookie session via `nuxt-auth-utils` (HttpOnly, Secure, SameSite=Lax). The whole app also sits behind Cloudflare Access.
+- Sealed cookie session via `nuxt-auth-utils`. In production the whole app also sits behind Cloudflare Access.
 
 ### Provider connections
 
-- A Connections page with Connect Spotify and Connect Tidal buttons, using Authorization Code with PKCE for both.
-- Callbacks at `https://<host>/auth/spotify/callback` and `https://<host>/auth/tidal/callback`, left reachable through Cloudflare Access.
-- Tokens encrypted at rest with AES-256-GCM (Node `crypto`), key from `TOKEN_ENCRYPTION_KEY`.
-- Refresh before expiry. If a refresh fails, mark the account "needs reconnect", show a banner, and skip that side's writes.
+- A Connections page with Connect Spotify and Connect Tidal, using Authorization Code with PKCE for both (no client secrets needed).
+- Callbacks at `<PUBLIC_BASE_URL>/auth/spotify/callback` and `/auth/tidal/callback`. Spotify rejects `localhost`, so development runs on `127.0.0.1:4050`.
+- Tokens encrypted at rest with AES-256-GCM, key from `TOKEN_ENCRYPTION_KEY`, refreshed before expiry. A failed refresh marks the account "needs reconnect".
 
-### Spotify specifics
+### Spotify
 
-- Development Mode is enough for one user: the app owner needs Premium, and each app allows up to 5 allowlisted users ([Spotify announcement](https://developer.spotify.com/blog/2026-02-06-update-on-developer-access-and-platform-security)).
-- Quota is shared per developer account; a 429 carrying reason `QUOTA_EXCEEDED` means quota, anything else is a rate limit. Honour `Retry-After` either way ([quota update](https://developer.spotify.com/blog/2026-07-23-web-api-quota-updates)).
-- Scopes: `user-library-read`, `user-library-modify`, `playlist-read-private`, `playlist-modify-private`, `playlist-modify-public`.
-- Saved-track writes moved to `PUT` and `DELETE /me/library`, which take Spotify URIs. Playlist item endpoints moved from `/tracks` to `/items`; the old paths return 403 ([changelog](https://developer.spotify.com/documentation/web-api/references/changes/february-2026), [SDK issue](https://github.com/spotify/spotify-web-api-ts-sdk/issues/159)).
-- Get Several Tracks is gone and search returns at most 10 results. Saved-track and playlist responses already include full track objects with `external_ids.isrc`, so no extra lookups are needed.
-- Playlist contents are only returned for the user's own playlists, which matches the owned-only scope.
+- Development Mode is enough for one user (owner needs Premium; up to 5 allowlisted users).
+- Quota is unpublished and shared per developer account. A 429 with reason `QUOTA_EXCEEDED` is never retried: the service pauses until `Retry-After` (reported cooldowns are 13 to 18 hours), or 6 hours when none is given (`0003`).
+- There is no batch ISRC lookup, so Spotify lookups are rationed and spent only at push time, on songs being pushed.
+- Playlist items are readable only for playlists the user owns or collaborates on (`0006`).
 
-### Tidal specifics
+### Tidal
 
-- Open API at `openapi.tidal.com/v2`: JSON:API, OAuth with PKCE, scopes `collection.read`, `collection.write`, `playlists.read`, `playlists.write`, `search.read`, `user.read` ([provider overview](https://apis.io/providers/tidal/)).
-- Responses page at a fixed 20 items with a cursor, and developers report tight throttling. Serialise calls and back off on 429.
-- Most calls need a `countryCode`; take it from the user's profile.
-- Generate the client from Tidal's published OpenAPI spec ([reference](https://tidal-music.github.io/tidal-api-reference/)), not from memory: paths have changed over time.
+- JSON:API at `openapi.tidal.com/v2`, PKCE, pages of 20 with a cursor, tight throttling: calls are serialised and back off on 429.
+- Endpoints follow the published spec, not the original plan's table (`0001`): liked songs at `/userCollectionTracks/me/relationships/items`, owned playlists via `GET /playlists?filter[owners.id]=me`.
+- Removing from a playlist needs each entry's `meta.itemId`, so the adapter reads entries first.
+- Playlist items are read without a country code, so songs Tidal will not play in the account's country are kept and marked unavailable instead of silently dropping out of the read.
 
-### Operations each adapter must support
+### Adapter interface
 
-| Operation | Spotify | Tidal (v2) |
-| --- | --- | --- |
-| Read liked tracks | `GET /me/tracks` | `GET /userCollections/{id}/relationships/tracks` |
-| Add liked tracks | `PUT /me/library` | `POST /userCollections/{id}/relationships/tracks` |
-| Remove liked tracks | `DELETE /me/library` | `DELETE /userCollections/{id}/relationships/tracks` |
-| List playlists | `GET /me/playlists`, keep owner = me | `GET /userCollections/{id}/relationships/playlists` (confirm it separates owned from favourited) |
-| Read playlist tracks | `GET /playlists/{id}/items` | `GET /playlists/{id}/relationships/items` |
-| Add to playlist | `POST /playlists/{id}/items` | `POST /playlists/{id}/relationships/items` |
-| Remove from playlist | `DELETE /playlists/{id}/items` | `DELETE /playlists/{id}/relationships/items` |
-| Create playlist | `POST /me/playlists` | `POST /playlists` |
-| Look up by ISRC | `GET /search?q=isrc:{isrc}&type=track` | `GET /tracks?filter[isrc]={isrc}` |
-| Free-text search | `GET /search` (max 10 results) | search results endpoint per the spec |
-
-Adapter interface, so a third service can be added later:
+The interface is read-only today (`server/providers/types.ts`):
 
 ```ts
 export interface MusicProvider {
   readonly id: ProviderId
-  getLikedTracks(): Promise<ProviderTrack[]>
-  getOwnedPlaylists(): Promise<ProviderPlaylist[]>
+  readonly isrcBatchSize: number                       // Spotify 5 (OR search), Tidal 20
+  getLikedTracks(): Promise<ProviderTrack[]>           // includes songs no longer offered, available: false
+  getPlaylists(): Promise<ProviderPlaylist[]>          // owned, collaborative and followed, with access
   getPlaylistTracks(playlistId: string): Promise<ProviderTrack[]>
-  addLiked(trackIds: string[]): Promise<WriteResult>
-  removeLiked(trackIds: string[]): Promise<WriteResult>
-  addToPlaylist(playlistId: string, trackIds: string[]): Promise<WriteResult>
-  removeFromPlaylist(playlistId: string, trackIds: string[]): Promise<WriteResult>
-  createPlaylist(name: string): Promise<string>
-  findByIsrc(isrc: string): Promise<ProviderTrack[]>
+  findByIsrcs(isrcs: string[]): Promise<IsrcLookup>
   search(query: string): Promise<ProviderTrack[]>
 }
-
-export interface ProviderTrack {
-  providerTrackId: string
-  isrc: string | null
-  title: string
-  artists: string[]
-  album: string
-  durationMs: number
-  explicit: boolean
-  version: string | null
-}
-
-// WriteResult: per-item success or failure with the provider's error, never all-or-nothing
 ```
 
-## Matching engine
+Push (M5) adds the writes, each returning a per-item result rather than all-or-nothing: `addLiked`, `removeLiked`, `addToPlaylist`, `removeFromPlaylist`, `createPlaylist`. The Tidal cleanup's writes live in its own job for now.
 
-ISRC matches link automatically; everything else is proposed for human review in the MVP, because a wrong link is worse than a missing one.
+## Pull
 
-For each source track that needs a counterpart on the other service:
+A pull reads one service and updates main. It never writes to either service. It runs in checkpointed stages (fetch, link, pair, merge) and resumes after a pause or restart (`0003`).
 
-1. Existing link: if a TrackLink exists, use it. Links with method `manual` are never re-evaluated.
-2. ISRC lookup on the target service.
-   - One result: link with method `isrc`, confidence 1.0.
-   - Several results (same recording on different releases): prefer the same album title, then the same explicit flag, then the closest duration. Any of them is the same recording, so the pick is cosmetic.
-   - No result, or no ISRC on the source: go to step 3.
-3. Fuzzy search on the target with a normalised "artist title" query, scoring each candidate.
-   - Best score at or above the review floor: create a `linkReview` pending action with the top candidate pre-selected. Never auto-link in the MVP.
-   - Nothing at or above the floor: record the track as unmatched.
-4. Unmatched: keep a TrackLink with a null provider ID and a reason: `not_found` (ISRC and search both empty), `low_confidence` (candidates, none good enough), or `ignored` (user said don't sync this one).
+1. **Fetch** liked songs and every listed playlist from the service. Followed playlists are listed but not read.
+2. **Link** each song to a canonical record: an existing link, else a canonical song with the same ISRC, else a new canonical song. No lookups against the other service are made.
+3. **Pair** playlists with main's collections: an existing link, else by normalised name, preferring a same-named collection this service is not on yet.
+4. **Merge** each collection's changes since the service's last snapshot into main, then save the new snapshot.
 
-Region locking can't be told apart from absence reliably, since Spotify no longer returns available markets, so it is not a separate reason.
+Diff rules for one song in one collection, read one service at a time:
 
-### Normalisation
+| Service (snapshot → now) | Main | Result |
+| --- | --- | --- |
+| no snapshot yet (first pull) | anything | Every song becomes active in main; nothing is removed, no conflicts |
+| absent → present | not in main, or active | Add to main (or confirm it is there) |
+| absent → present | removed after this service's snapshot | Conflict: added here, removed from main since |
+| present → absent | active, unchanged since the snapshot | Remove from main (tombstone) |
+| present → absent | re-added or confirmed by another service since | Conflict: removed here, added elsewhere since |
+| present → present, absent → absent | anything | No change |
 
-- Lowercase, Unicode-normalise, and strip diacritics.
-- Pull bracketed or dashed version tags ("Remastered 2011", "Live", "Radio Edit", "Acoustic") into a separate version field.
-- Remove "feat." and "ft." segments from titles; compare featured artists separately.
-- Replace "&" with "and", collapse punctuation and whitespace.
+A pull that finds a song newly added on a service when main already has it records a **confirm** by that service; that is what turns "removed on Spotify, added on Tidal" into a conflict instead of a silent removal.
 
-### Scoring (starting values, to tune against real data)
+Sanity guard: if a collection comes back empty while its snapshot was not, or would lose more than 10% of its songs (at least 5), it is not merged and is **held**. Oliver accepts the removals or leaves it held. A playlist that disappears from a service is held as **gone**: keep it in main (push would recreate it) or remove its songs from main.
 
-```latex
-score = 0.45 \cdot title + 0.35 \cdot artist + 0.20 \cdot duration
-```
+## Status
 
-- Title and artist: token-set similarity (0 to 1) on normalised strings.
-- Duration: 1.0 within 2 seconds, falling linearly to 0 at 10 seconds apart.
-- A version-tag mismatch (live vs studio, remix vs original) caps the score below the review floor.
-- An explicit-flag mismatch subtracts 0.05.
-- Review floor 0.60. A later setting can auto-accept above a higher threshold (off by default).
+Status is derived, not stored: for each collection and service it compares main with the service's snapshot.
 
-### Manual search (Sonarr-style)
+- **Add on a service**: active in main, not on the service.
+- **Remove on a service**: removed in main, still on the service.
+- **Unavailable**: listed on the service but not playable there; kept in main, skipped by push.
+- **Not compared**: the service's copy is a followed playlist, or the service has not been pulled yet.
+- **New playlist**: on main but not on the service at all; push would create it. If a same-named playlist is already there, the Library warns that pushing would make a second copy.
 
-- Open from any unmatched or review item.
-- Shows the source track, an editable pre-filled query, and candidates with title, artists, album, duration, explicit flag, version, and the score breakdown.
-- Actions: Link (method `manual`, confidence 1.0), Ignore, or search again. Spotify returns at most 10 results per query, so page with an offset.
+This is the plan's persistent queue, recast: "changes not pushed yet" falls out of main and the snapshots, and only decisions (held-back changes, resolved conflicts, accepted holds) are stored.
 
-### Unmatched re-check (phase 2)
+## Push (M5)
 
-A scheduled job re-runs steps 2 and 3 for unmatched tracks not checked in the last 7 days. A new ISRC hit links and queues an add; a new fuzzy hit queues a review.
+Push makes one service match main. It is the only code path that writes to Spotify or Tidal.
 
-### Tests
+1. Take the run lock and create a run (kind push).
+2. Show the preview: songs to add and to remove per collection, removals listed separately, new playlists called out. Oliver can hold back any change; held-back changes stay held and are not asked about again.
+3. Look up each song to add on the target service: an existing link, else ISRC lookup (Spotify rationed per run and paused on quota, Tidal 20 at a time). Misses go to fuzzy search, which proposes candidates for review and never auto-links.
+4. Re-read each affected collection and write only what is still needed. Spotify playlists accept duplicates, so a blind add would create them.
+5. Write in batches per collection (Spotify 40 for liked, Tidal 50), recording a result per song. Retry 429 and 5xx up to 3 times honouring `Retry-After`; already-present on add and already-absent on remove count as success.
+6. Update the snapshot from what actually succeeded. A failed write keeps a failed state with its error and is retried on the next push; a later success clears it.
 
-Keep a fixture set of tricky pairs as unit tests: remasters, featured artists, live versions, non-Latin titles, and identical titles by different artists.
+The push button follows where changes are waiting: Push to Spotify, Push to Tidal, or Push to both as a split button. Every button shows its count and opens the preview first. The same buttons appear per collection and for the whole library.
 
-## Sync engine
+Tidal playlist cleanup (`0004`) writes to Tidal directly today, like `git gc`. Once push exists, cleanup writes should go through the same write path.
 
-Each side is diffed against its own last snapshot, which turns "present on one side only" into a clear intent: added here, or removed there. Sync only ever plans; Apply is the only path that writes. One planning routine serves the button and, later, the scheduler.
+## Matching
 
-### Bootstrap (first run only)
+Matching happens at push time, because only then is a song's ID on the target service needed. Pull compares ISRCs in memory, which is free.
 
-1. Both accounts connected; pull liked tracks and owned playlists from both sides in full.
-2. Pair playlists by normalised name. Unpaired playlists are shown so the user can pair them by hand, create them on the other side, or exclude them.
-3. Run every track through the matching engine.
-4. Canonical membership for each collection = the union of both sides. Bootstrap never removes anything.
-5. Queue the plan (adds per side, reviews needed, unmatched) for the user to edit.
-6. On Apply, execute the queue, then write snapshots for both sides. These become the first baseline.
+1. Existing link: use it. Links with method `manual` are never re-evaluated.
+2. ISRC lookup on the target. Several results (the same recording on different releases): prefer the same album title, then the same explicit flag, then the closest duration.
+3. Fuzzy search with a normalised "artist title" query, scoring each candidate. At or above the review floor, propose the top candidate for review. Below it, record the song as unmatched.
+4. Unmatched songs keep a link row with a null ID and a reason: `not_found`, `low_confidence`, `no_isrc_match` (ISRC missed, fuzzy not tried yet) or `ignored`.
 
-### Sync (plans only)
+Normalisation: lowercase, Unicode-normalise, strip diacritics; pull version tags ("Remastered 2011", "Live", "Radio Edit") into a separate field; remove "feat." segments; "&" becomes "and"; collapse punctuation and whitespace.
 
-1. Take the run lock; if a sync or apply is running, skip. Create a run record (kind sync).
-2. Refresh tokens. A side that needs reconnecting is shown as stale.
-3. Fetch the full current state of both sides.
-4. Sanity guard: if a collection comes back empty while its snapshot was not, or would lose more than 10% of its tracks (minimum 5), stop that collection and flag it. A failed or partial fetch must never look like a mass deletion.
-5. Detect new playlists on either side and queue creating them on the other.
-6. Send any track not yet linked through matching.
-7. Diff each collection per canonical track (table below) and update the queue: new differences arrive queued, and failed items from the last apply come back queued.
-8. Stop. Nothing is written.
+Scoring (starting values, to tune against real data): `score = 0.45·title + 0.35·artist + 0.20·duration`. Title and artist use token-set similarity; duration is 1.0 within 2 seconds, falling to 0 at 10 seconds. A version-tag mismatch caps the score below the floor; an explicit-flag mismatch subtracts 0.05. Review floor 0.60.
 
-The queue is persistent state, not a by-product of one sync. An item stays until its condition no longer holds (for example, the track is now on both sides), at which point it is marked obsolete. A choice the user made (userSet) survives every later sync while the difference is unchanged, so a dequeued item stays dequeued rather than reappearing as queued. Snapshots only detect new changes; the queue remembers the outstanding ones.
-
-### Apply
-
-1. Take the run lock and create a run record (kind apply).
-2. Show a confirmation with the number of queued writes per service, listing removals separately.
-3. For each affected collection, fetch fresh state and mark items no longer needed (already added or already removed) as obsolete.
-4. Execute the remaining queued items in batches per provider and collection, recording a per-item result.
-5. Update membership and snapshots from what actually succeeded. Dequeued items are left alone for next time.
-
-### Diff rules for one track in one collection
-
-| Spotify (snapshot → now) | Tidal (snapshot → now) | Meaning | Action |
-| --- | --- | --- | --- |
-| absent → present | absent → absent | Added on Spotify | Add on Tidal if matched, else record as unmatched |
-| absent → absent | absent → present | Added on Tidal | Add on Spotify if matched, else record as unmatched |
-| present → absent | present → present | Removed on Spotify | Remove on Tidal; membership becomes removed |
-| present → present | present → absent | Removed on Tidal | Remove on Spotify; membership becomes removed |
-| absent → present | absent → present | Added on both | Link if needed; no write |
-| present → absent | present → absent | Removed on both | Membership becomes removed; no write |
-| removed on one side | added on the other | Conflict | Ask the user; no automatic write |
-| present, unchanged | absent, now matchable | Newly available | Add on Tidal (same rule in reverse) |
-
-### Writes and failures
-
-- Removals are queued like any other change; the Apply confirmation lists them separately so they are always seen before writing.
-- Before adding to a playlist, check the freshly fetched state: Spotify playlists accept duplicates, so a blind add creates them.
-- Within a run, retry 429 and 5xx responses up to 3 times with backoff, honouring `Retry-After`.
-- A write that still fails keeps status `failed` with `lastError`, and stays in the queue, so the next Apply retries it.
-- A successful retry clears the failure; nothing stale stays in the UI.
-- Already-present on add, or already-absent on remove, counts as success.
+Manual search (M3): open from any unmatched or review item; shows the source song, an editable query and scored candidates. Link (method `manual`), Ignore, or search again. Spotify returns at most 10 results per query, so page with an offset.
 
 ## UI
 
-The main screen is a diff tool: Spotify on the left, Tidal on the right, one aligned row per canonical track, and a queue column showing what will happen and what failed.
+The main screen is a diff tool: Spotify on the left, main in the middle, Tidal on the right, one aligned row per canonical song.
 
-### Global header
+### Header
 
-- Sync button (plans only), Apply button showing the queued count, and the last sync and apply times.
-- Live progress during a run via server-sent events.
+- Navigation (Library, Review, Unmatched, Cleanup, Activity, Connections) and each service's connection or quota state.
 
-### Library diff (home)
+### Library (home)
 
-- Sidebar: Liked songs, then each playlist, each with badges for pending, failed, review and unmatched counts.
-- Main pane: rows aligned by canonical track. Each side shows its copy or a gap. Default filter is "differences only"; a toggle shows everything.
-- Row states: in sync, add to Tidal, add to Spotify, remove, review needed, unmatched, failed, conflict.
-- Third column: the queued change for that row with a queue/dequeue toggle, its status, and "find match" (opens manual search). Bulk queue and dequeue per collection and per change type.
-- Collection actions: Merge (union, the default), Mirror Spotify → Tidal, Mirror Tidal → Spotify. Mirror queues the removals it implies, like any other change.
+- A service card per side: Pull Spotify and Pull Tidal (or Resume after a pause), with the last pull time, changes waiting to push, and live progress over SSE.
+- The push button, showing where changes wait; disabled until M5.
+- Sidebar: Liked songs, then playlists grouped Mine, Collab and Followed. Within a tab, collections that need attention come before those in sync. Badges show conflicts, differences, holds, and "new" for playlists push would create.
+- Hero card for the selected collection: where it lives on each service (owned, with someone, or followed), held pulls with their decision buttons, and new-playlist or same-name warnings.
+- Rows aligned by canonical song. Each side shows its copy or a gap; the action column says what push would do, with a Spotify · main · Tidal strip of ticks and crosses. Default filter is differences only; a toggle shows everything.
+- Conflicts are decided on the row: keep in main or remove from main.
 
 ### Other screens
 
-- Queue: every queued, dequeued and failed change across collections, with queue all, dequeue all, and Apply. Failed rows show the last error and attempt count.
-- Review queue: fuzzy candidates awaiting a decision, using the manual search panel.
-- Unmatched: tracks with no counterpart, their reason and last check time, plus "check again".
-- Runs: history of sync runs with trigger, dry-run flag and counts; open one to see its actions.
-- Connections and settings: connect or reconnect each service, excluded playlists, matching thresholds, and (phase 2) the schedule.
+- **Activity**: every pull and cleanup run, its stages, counts and log; open one to see what it changed.
+- **Cleanup**: Tidal duplicate and empty playlists by tier, with merge and delete for exact copies and empties.
+- **Connections**: connect, reconnect or disconnect each service.
+- **Review** and **Unmatched** (M3): fuzzy candidates awaiting a decision, and songs with no counterpart, using the manual search panel.
 
 ### Visual design
 
-Black, mint and coral: big rounded cards, pill tags and buttons, heavy techno display type, and a dot-matrix equalizer motif. The reference screen is "Direction B" on the [library diff canvas](https://claude.ai/artifact/PXB32ZqE84YvMas9J9UkvP); the other artboard there is a superseded direction.
+Black, mint and coral: big rounded cards, pill tags and buttons, heavy techno display type, and a dot-matrix equalizer motif. The reference screen is "Direction B" (`docs/direction-b.pdf`).
 
 | Token | Value | Use |
 | --- | --- | --- |
@@ -314,154 +262,108 @@ Black, mint and coral: big rounded cards, pill tags and buttons, heavy techno di
 | text | `#F2F2F2` | Primary text on black |
 | text-muted | `#A3A3A3`, `#8C8C8C` | Labels and metadata |
 | mint | `#D4F5CF` | Collection hero card, adds, in sync, primary pills; black text on it |
-| coral | `#FF4438` | Queue and Apply card, removals, failures; black text on it |
-| amber | `#F2B84B` | Review needed |
-| Spotify badge | `#1ED760` | Small dot on the Spotify column only |
-| Tidal badge | `#FFFFFF` | Small dot on the Tidal column only |
+| coral | `#FF4438` | Push card, removals, failures; black text on it |
+| amber | `#F2B84B` | Review needed, conflicts, holds |
+| Spotify badge | `#1ED760` | Spotify column only |
+| Tidal badge | `#FFFFFF` | Tidal column only |
 
-- Type: Orbitron (900) for display only: logo, collection title, queue count. Space Grotesk for UI text and track titles. JetBrains Mono for ISRCs, scores and timestamps.
+- Type: Orbitron 900 for display only (logo, collection title, counts). Space Grotesk for UI text and song titles. JetBrains Mono for ISRCs, scores and timestamps.
 - Shapes: 28 px radius cards, 20 px radius rows, fully rounded pills for tags, buttons and collection links.
-- Row states are filled circle badges with a glyph: mint +, coral −, amber ?, coral ! on black for failed, grey outline ∅ for unmatched. A dequeued change shows an outline badge and a grey Dequeued pill.
-- Equalizer: a 7-row dot matrix with off dots at 12 to 16% opacity. Use it on the queue card as the brand motif, and on the runs card where each column is one run's change count. Nowhere else.
-- Motion: during a sync the equalizer columns animate and rows settle as they resolve. Respect reduced-motion.
-- Accessibility: black text on mint and coral (both above 4.5:1), 44 px touch targets, and every state carries a glyph as well as a colour.
+- Row states are filled circle badges with a glyph: mint +, coral −, amber ?, coral ! on black for failed, grey outline ∅ for unmatched, ⊘ for unavailable.
+- Equalizer: a 7-row dot matrix with off dots at 12 to 16% opacity, on the push card and the runs card only.
+- Accessibility: black text on mint and coral (both above 4.5:1), 44 px touch targets, and every state carries a glyph as well as a colour. Respect reduced motion.
 
-## Deployment
+## Deployment (not built yet)
 
-One Docker container on Unraid, reached through the existing Cloudflare tunnel and protected by Cloudflare Access.
+One Docker container on Unraid, reached through the existing Cloudflare tunnel and protected by Cloudflare Access. It can be built whenever Oliver wants it deployed.
 
-### Container
+- Multi-stage Dockerfile: build the Nuxt app, copy `.output` into a slim Node 24 image, run `node .output/server/index.mjs` as a non-root user on port 8080, honouring `PUID` and `PGID`.
+- One volume, `/config`: the SQLite database (`DATABASE_PATH=/config/crossfade.db`) and logs.
+- `/health` endpoint and a Docker `HEALTHCHECK`; image built by GitHub Actions and pushed to GHCR, plus an Unraid template XML.
+- Cloudflare: a public hostname on the tunnel and an Access application covering it. No bypass is needed for OAuth callbacks, since the provider redirects the user's own browser. Register the exact callback URLs in both developer dashboards.
+- Backups: a nightly `VACUUM INTO` copy of the database, keeping the last 7, alongside Unraid's appdata backup.
 
-- Multi-stage Dockerfile: build the Nuxt app, copy the `.output` folder into a slim Node LTS image, and run `node .output/server/index.mjs`.
-- Runs as a non-root user on port 8080, honouring `PUID` and `PGID` (Unraid defaults 99 and 100).
-- One volume, `/config`, mapped to `/mnt/user/appdata/<app>`: the SQLite database and logs.
-- `/health` endpoint and a Docker `HEALTHCHECK`.
-- Image built by GitHub Actions and pushed to GHCR, plus an Unraid template XML for one-click install.
-
-### Configuration (environment variables)
-
-| Variable | Purpose |
-| --- | --- |
-| `PUBLIC_BASE_URL` | e.g. `https://crossfade.<your-domain>`; used to build OAuth redirect URIs |
-| `APP_USERNAME`, `APP_PASSWORD_HASH` | App login |
-| `NUXT_SESSION_PASSWORD` | Seals the session cookie (at least 32 characters) |
-| `TOKEN_ENCRYPTION_KEY` | Encrypts provider tokens at rest |
-| `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET` | Spotify app credentials |
-| `TIDAL_CLIENT_ID`, `TIDAL_CLIENT_SECRET` | Tidal app credentials |
-| `TZ`, `PUID`, `PGID` | Unraid conventions |
-
-Secrets never go in the image or the repo. A `.env.example` documents them.
-
-### Cloudflare
-
-- Add a public hostname on the tunnel pointing at the container, and an Access application covering the whole hostname.
-- No bypass rule is needed for the OAuth callbacks: the provider redirects the user's own browser, which already holds the Access session.
-- Register the exact callback URLs in both developer dashboards.
-
-### Operations
-
-- Logs: structured logging to console and a rolling file under `/config/logs`.
-- Backups: a nightly `VACUUM INTO` copy of the database, keeping the last 7, alongside Unraid's own appdata backup.
+Configuration is by environment variable; `.env.example` lists them all. Secrets never go in the image or the repo.
 
 ## Milestones
 
-Build in eight steps; M0 to M5 make the MVP, and nothing writes to a real library until M5.
+Work one milestone at a time and stop at each "Done when" for Oliver to verify. Nothing writes to the real library before M5, except the test playlists and the Tidal cleanup.
 
-### M0: API spike (gate)
+| Milestone | Status |
+| --- | --- |
+| M0 API spike | Replaced by V0 (`0002`) |
+| V0 Login, connections, read adapters, dry-run diff | Done. Its dry-run sync was replaced by pull |
+| Tidal playlist cleanup | Done (`0004`) |
+| **M4 Main and pull** | **In progress**: pull, conflicts, holds, status and the Library page work; awaiting Oliver's check on the real library |
+| M5 Push | Next |
+| M3 Manual search and review | After M5 |
+| Docker and Unraid | Whenever deployment is wanted |
+| M6 Automation | Phase 2 |
+| M7 Artists and albums | Stretch |
 
-- [ ] Register a Spotify app (Development Mode) and a Tidal app; set the callback URLs.
-- [ ] Throwaway console app: OAuth to both, read liked tracks and one playlist, add and remove one track on a test playlist, ISRC lookup on each side.
+### M4 Main and pull
 
-Done when: every operation in the adapter table works against the real accounts, and it is known how Tidal separates owned from favourited playlists. If a write is blocked, stop and revisit the plan.
+- [x] Memberships in main, a snapshot per service, checkpointed pull per service.
+- [x] Conflicts, the sanity guard and gone playlists, decided on the Library page.
+- [x] Songs a service will not play kept as unavailable.
+- [x] Collaborative and followed playlists (`0006`).
+- [x] Status per collection and service, and the push button showing where changes wait.
 
-### M1: Skeleton and auth
+Done when: pulling Tidal then Spotify builds a main Oliver agrees with, the Library shows what each service is missing, and pulling again with nothing changed reports nothing new.
 
-- [ ] Nuxt project layout, SQLite with Drizzle migrations, app login.
-- [ ] Connections page with both OAuth flows, encrypted token storage, background refresh.
-- [ ] Dockerfile, deployed on Unraid behind Cloudflare Access.
+### M5 Push (MVP complete)
 
-Done when: login works at the public URL, both services show Connected, and tokens survive a container restart.
+- [ ] Preview per service with removals separate, and hold-back.
+- [ ] ID lookup at push time, rationed for Spotify, paused and resumed on quota.
+- [ ] Fresh read before writing, per-song results, retries and failure states.
+- [ ] Creating playlists on the other service.
+- [ ] Route cleanup writes through push.
 
-### M2: Read-only diff and matching
+Done when: a song added on Spotify reaches Tidal after pull Spotify and push Tidal, a removal does the same, and a forced failure shows and then clears on retry.
 
-- [ ] Read side of both adapters, normalisation, ISRC matching, fuzzy scoring with fixture tests.
-- [ ] Playlist pairing and the library diff screen. No writes of any kind.
+### M3 Manual search and review
 
-Done when: every collection renders with correct matched, review and unmatched states, and fixture tests pass.
+- [ ] Manual search panel, review queue, ignore, Unmatched screen.
 
-### M3: Manual search and review
+Done when: any review item can be linked or ignored in under three clicks, and the decision survives the next push.
 
-- [ ] Manual search panel, review queue, ignore, unmatched screen.
+### M6 Automation (phase 2)
 
-Done when: any review item can be linked or ignored in under three clicks, and the decision survives the next run.
+- [ ] Sync (pull both, push both) once pull and push are trusted.
+- [ ] Scheduled pulls, re-check of unmatched and pulled songs, optional fuzzy auto-accept threshold.
 
-### M4: Sync and queue
-
-- [ ] Snapshots, three-way diff, persistent queue with queue and dequeue, sanity guard, bootstrap plan.
-
-Done when: a sync on the real library produces a queue Oliver agrees with, line by line, and a dequeued item stays dequeued after the next sync.
-
-### M5: Writes (MVP complete)
-
-- [ ] Apply with the fresh-state check, per-item results, retries, and failure state.
-- [ ] Apply the bootstrap for real.
-
-Done when: a track added on one side appears on the other after Sync; a removal propagates after Apply; a forced failure shows, then clears on retry.
-
-### M6: Automation (phase 2)
-
-- [ ] Scheduled sync (plans only) through the same routine, unmatched re-check, optional fuzzy auto-accept threshold.
-
-### M7: Artists and albums (stretch)
+### M7 Artists and albums (stretch)
 
 - [ ] Followed artists and saved albums as new canonical entities, albums matched by UPC.
 
 ## Risks and open questions
 
-The biggest risk is platform policy, not code: Spotify cut Development Mode back once in 2026 and could again, which is why M0 is a gate.
+The biggest risk is platform policy, not code: Spotify cut Development Mode back in 2026 and could again.
 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
-| Spotify tightens Development Mode further | Writes stop working | Adapters isolated behind one interface; watch the Web API changelog; the store stays useful read-only |
-| Spotify refresh tokens reportedly expire after six months ([tracker](https://vorplabs.com/agent-tools/spotify-api-changes); unverified) | Sync quietly stops | Treat refresh failure as "needs reconnect" with a visible banner; confirm in M0 |
-| Tidal app not cleared for user scopes; some developers report an approval wait ([discussion](https://github.com/orgs/tidal-music/discussions/321)) | Tidal OAuth fails | Found in M0 before any real code |
-| Tidal throttling and 20-item pages | Slow bootstrap | Serialised calls, backoff, progress UI; the library is small |
-| Failed or partial fetch looks like deletions | Tracks removed on both sides | Sanity guard; Sync never writes; removals listed separately at Apply |
-| Wrong fuzzy match | Wrong song added on the other side | No fuzzy auto-link in the MVP; links can be undone from the review screen |
-| Spotify playlists allow duplicates | Repeated adds | Check fresh state before every add |
+| Spotify tightens Development Mode further | Writes stop working | Adapters isolated behind one interface; main stays useful read-only |
+| Spotify quota exhausted (cooldowns of 13 to 18 hours) | Push stalls | Lookups only at push time, rationed per run; never retry `QUOTA_EXCEEDED`; runs pause and resume |
+| Spotify refresh tokens reportedly expire after six months (unverified) | Pulls quietly stop | Refresh failure shows "needs reconnect" |
+| Tidal throttling and 20-item pages | Slow pulls | Serialised calls, backoff, batching, checkpoints |
+| A failed or partial read looks like deletions | Songs removed from main, then pushed | Sanity guard holds the collection; push previews removals separately |
+| Wrong fuzzy match | Wrong song added on the other side | No fuzzy auto-link; links can be undone from review |
+| Spotify playlists allow duplicates | Repeated adds | Fresh read before every push |
+| Pushing to a collaborative playlist | Edits someone else's playlist | Shown in the preview as theirs |
 
 Open questions:
 
 - [ ] Should playlist renames on one side propagate to the other?
-- [ ] Should a new playlist on one side be proposed automatically, or only when opted in?
-- [ ] How does Tidal's API separate owned from favourited playlists? (answered in M0)
+- [ ] Should a playlist on one side only be created on the other automatically, or only when chosen in the push preview?
+- [ ] Should Tidal collaborative playlists be read?
+- [x] How does Tidal separate owned from favourited playlists? `filter[owners.id]=me` versus `/userCollectionPlaylists` (`0001`).
+- [x] Should other people's playlists be ignored? No: collaborative ones sync, followed ones are paired but not read (`0006`).
 
-## Working instructions for Claude Code
+## Working instructions
 
-Work one milestone at a time and stop at each "Done when" for Oliver to verify before moving on.
-
-- Treat API knowledge from training data as stale. Check every Spotify call against the [February 2026 changelog](https://developer.spotify.com/documentation/web-api/references/changes/february-2026) and generate the Tidal client from its current OpenAPI spec.
-- Prefer a thin typed client per provider, built on `ofetch`, over third-party Spotify SDKs, unless an SDK is confirmed to use the `/items` and `/me/library` endpoints.
-- No writes to the real library before M5, except to a dedicated test playlist on each service.
-- Keep `server/core` free of I/O: matching, diffing and planning are pure functions over snapshots.
-- Test the diff rules table-driven, one case per row of the diff table. Use Vitest, and test adapters against recorded HTTP fixtures.
-- Secrets stay out of the repo; maintain `.env.example`.
-- Ask before adding dependencies outside the stack. Record any deviation from this plan as a short decision note in `docs/decisions/`.
-- Start by writing a `CLAUDE.md` in the repo that summarises this plan's conventions.
-
-Suggested layout:
-
-```
-/app                         Nuxt app directory: pages, components, composables
-/server/api                  API routes (Nitro)
-/server/routes/auth          OAuth start and callback routes
-/server/core                 matching, diff, planning (pure TypeScript, no I/O)
-/server/providers/spotify    Spotify adapter
-/server/providers/tidal      Tidal adapter
-/server/db                   Drizzle schema and migrations
-/server/jobs                 sync runner, run lock, scheduler (phase 2)
-/shared/types                types shared by UI and server
-/tests                       Vitest unit and fixture-based adapter tests
-/deploy                      Dockerfile, Unraid template
-/docs/decisions              decision notes
-```
+- Treat API knowledge from training data as stale. Check Spotify calls against the February and March 2026 changelogs, and Tidal calls against the published OpenAPI spec.
+- Thin typed clients per provider on `ofetch`; no third-party Spotify SDKs unless confirmed to use `/items` and `/me/library`.
+- Keep `server/core` free of I/O.
+- Test diff rules table-driven, one case per row. Test adapters against recorded HTTP fixtures.
+- Secrets stay out of the repo; keep `.env.example` current.
+- Ask before adding dependencies outside the stack. Record any deviation from this plan in `docs/decisions/` and update this plan to match.
