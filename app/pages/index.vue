@@ -122,8 +122,7 @@ function action(row: StatusRowView): Action {
   switch (row.state) {
     case 'add': {
       const targets = on('missing')
-      const creates = targets.some(p => missingOn(selected.value).includes(p))
-      return { verb: 'Push →', targets, after: creates ? '· new playlist' : undefined, tone: '' }
+      return { verb: 'Push →', targets, tone: '' }
     }
     case 'remove': return { verb: 'Remove on', targets: on('extra'), tone: 'coral' }
     case 'unavailable': return { verb: 'Unavailable on', targets: on('unavailable'), tone: 'muted' }
