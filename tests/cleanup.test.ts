@@ -94,6 +94,11 @@ describe('playlist cleanup', () => {
 
     expect(job.outcomes).toMatchObject([{ status: 'done', added: 1, deleted: 1 }])
     expect(tidal.writes).toEqual(['add a id11', 'delete b'])
+
+    // It is an Activity entry, with a line per playlist.
+    const activity = db.select().from(schema.syncRuns).all().find(r => r.kind === 'cleanup')!
+    expect(activity).toMatchObject({ provider: 'tidal', status: 'succeeded', counts: { merged: 1, deleted: 1, added: 1, failed: 0 } })
+    expect(db.select().from(schema.syncEvents).all().map(e => e.message)).toContainEqual(expect.stringContaining('Merged "Emo"'))
     expect(tidal.playlists.a!.items.map(i => i.id)).toEqual(nums(1, 11).map(n => `id${n}`))
 
     const [backup] = db.select().from(schema.playlistBackups).all()

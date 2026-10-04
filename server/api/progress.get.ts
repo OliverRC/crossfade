@@ -1,4 +1,4 @@
-import { getProgress, onProgress } from '../../jobs/runner'
+import { getProgress, onProgress } from '../jobs/runner'
 
 export default defineEventHandler(async (event) => {
   const stream = createEventStream(event)

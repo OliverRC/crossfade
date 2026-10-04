@@ -1,8 +1,8 @@
-// Canonical store (plan: "Data model"). V0 holds tracks, links, collections, accounts, runs and
-// run checkpoints; memberships, snapshots and pending actions arrive with the queue in M4.
+// Canonical store (plan: "Data model"; docs/decisions/0005). Main is canonical tracks, collections and
+// memberships; each service has a snapshot per collection, the last state a pull read from it.
 import { sql } from 'drizzle-orm'
 import { index, integer, real, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core'
-import type { LinkMethod, LinkStatus, ProviderId, ProviderPlaylist, ProviderTrack, RunPause, RunStages, StageKey, SyncResult, UnmatchedReason } from '../../shared/types'
+import type { HoldReason, RunKind, SnapshotItem, LinkMethod, LinkStatus, ProviderId, ProviderPlaylist, ProviderTrack, RunPause, RunStages, StageKey, UnmatchedReason } from '../../shared/types'
 
 const createdAt = () => text('created_at').notNull().default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`)
 
@@ -72,7 +72,10 @@ export const providerAccounts = sqliteTable('provider_accounts', {
 
 export const syncRuns = sqliteTable('sync_runs', {
   id: integer('id').primaryKey({ autoIncrement: true }),
-  kind: text('kind').$type<'sync' | 'apply'>().notNull(),
+  /** sync: the V0 dry run. pull: read one service into main (docs/decisions/0005). */
+  kind: text('kind').$type<RunKind>().notNull(),
+  /** The service a pull or push works on; null for the V0 sync. */
+  provider: text('provider').$type<ProviderId>(),
   trigger: text('trigger').$type<'manual' | 'schedule'>().notNull(),
   startedAt: text('started_at').notNull(),
   finishedAt: text('finished_at'),
@@ -88,8 +91,8 @@ export const syncRuns = sqliteTable('sync_runs', {
   /** Playlist lists per provider, saved before their contents are fetched. */
   playlists: text('playlists', { mode: 'json' }).$type<Partial<Record<ProviderId, ProviderPlaylist[]>>>(),
   counts: text('counts', { mode: 'json' }).$type<Record<string, number>>(),
-  /** V0: the computed diff (provisional while paused), shown until the queue replaces it in M4. */
-  result: text('result', { mode: 'json' }).$type<SyncResult['collections']>(),
+  /** V0 syncs only: the dry-run diff they computed. Pulls leave it empty; the Library page reads main. */
+  result: text('result', { mode: 'json' }).$type<unknown>(),
 })
 
 /** One collection fetched from one provider during a run, so a resumed run does not fetch it again. */
@@ -151,3 +154,59 @@ export const unavailableItems = sqliteTable('unavailable_items', {
   /** Set when the song is back in the playlist. */
   restoredAt: text('restored_at'),
 }, t => [uniqueIndex('unavailable_items_playlist_item').on(t.provider, t.playlistId, t.itemId)])
+
+/** Main: a song belongs in a collection (active) or was removed from it (a tombstone, kept so a stale read cannot re-add it). */
+export const memberships = sqliteTable('memberships', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  collectionId: integer('collection_id').notNull().references(() => collections.id, { onDelete: 'cascade' }),
+  canonicalTrackId: integer('canonical_track_id').notNull().references(() => canonicalTracks.id, { onDelete: 'cascade' }),
+  state: text('state').$type<'active' | 'removed'>().notNull(),
+  changedAt: text('changed_at').notNull(),
+  /** The service whose pull made the change, or user. */
+  changedBy: text('changed_by').$type<ProviderId | 'user'>().notNull(),
+}, t => [uniqueIndex('memberships_collection_track').on(t.collectionId, t.canonicalTrackId)])
+
+/** What a service held in one collection at its last pull: the base the next pull compares against. */
+export const snapshots = sqliteTable('snapshots', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  provider: text('provider').$type<ProviderId>().notNull(),
+  collectionId: integer('collection_id').notNull().references(() => collections.id, { onDelete: 'cascade' }),
+  /** Null for liked songs. */
+  providerCollectionId: text('provider_collection_id'),
+  takenAt: text('taken_at').notNull(),
+  items: text('items', { mode: 'json' }).$type<SnapshotItem[]>().notNull(),
+  runId: integer('run_id'),
+}, t => [uniqueIndex('snapshots_provider_collection').on(t.provider, t.collectionId)])
+
+/** A pull that would undo a newer change in main stops on that song until Oliver decides. */
+export const conflicts = sqliteTable('conflicts', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  collectionId: integer('collection_id').notNull().references(() => collections.id, { onDelete: 'cascade' }),
+  canonicalTrackId: integer('canonical_track_id').notNull().references(() => canonicalTracks.id, { onDelete: 'cascade' }),
+  /** The service whose pull found it, and what that service did. */
+  provider: text('provider').$type<ProviderId>().notNull(),
+  change: text('change').$type<'added' | 'removed'>().notNull(),
+  detectedAt: text('detected_at').notNull(),
+  resolvedAt: text('resolved_at'),
+  /** keep: the song stays in main. remove: it leaves main. */
+  resolution: text('resolution').$type<'keep' | 'remove'>(),
+}, t => [index('conflicts_open').on(t.collectionId, t.resolvedAt)])
+
+/** A collection a pull did not merge because the read looked wrong (sanity guard). */
+export const pullHolds = sqliteTable('pull_holds', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  provider: text('provider').$type<ProviderId>().notNull(),
+  collectionId: integer('collection_id').notNull().references(() => collections.id, { onDelete: 'cascade' }),
+  runId: integer('run_id').notNull(),
+  /** empty: came back empty. mass_removal: would lose too many songs. gone: the playlist is no longer on the service. */
+  reason: text('reason').$type<HoldReason>().notNull(),
+  before: integer('before').notNull(),
+  removing: integer('removing').notNull(),
+  detectedAt: text('detected_at').notNull(),
+  resolvedAt: text('resolved_at'),
+  /**
+   * accepted: Oliver confirmed the removals. superseded: a later pull no longer tripped the guard.
+   * kept / removed: for a playlist gone from the service, main kept it or removed its songs.
+   */
+  resolution: text('resolution').$type<'accepted' | 'superseded' | 'kept' | 'removed'>(),
+})

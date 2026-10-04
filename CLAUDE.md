@@ -4,15 +4,15 @@ Self-hosted two-way sync of one person's Spotify and Tidal libraries (liked song
 
 ## Status
 
-- Current milestone: **V0** (replaces M0, covers M1 and most of M2; see `docs/decisions/0002`). Done when Oliver can log in, connect both services, and see a real dry-run diff of his liked songs and playlists.
-- Next: M4 (main and pull), then M5 (push), then M3 (manual search and review); see `docs/decisions/0005`. A one-press sync (pull both, push both) waits until pull and push are trusted. Docker and Unraid packaging can slot in whenever he wants it deployed.
-- Syncs are checkpointed and resumable, and pause on quota (`docs/decisions/0003`). Spotify's Development Mode quota is unpublished, with reported cooldowns of 13 to 18 hours: never retry `QUOTA_EXCEEDED`, and keep Spotify lookups rationed.
+- Current milestone: **M4 Main and pull** (`docs/decisions/0005`). Done when pulling Tidal then Spotify builds a main Oliver agrees with, the Library page shows what each service is missing, and pulling again with nothing changed reports nothing new. V0 is done; its dry-run sync was replaced by pull.
+- Next: M5 (push), then M3 (manual search and review). A one-press sync (pull both, push both) waits until pull and push are trusted. Docker and Unraid packaging can slot in whenever he wants it deployed.
+- Pulls are checkpointed and resumable, and pause on quota (`docs/decisions/0003`). Spotify's Development Mode quota is unpublished, with reported cooldowns of 13 to 18 hours: never retry `QUOTA_EXCEEDED`, and keep Spotify lookups rationed (they belong to push).
 - Work one milestone at a time. Stop at each milestone's "Done when" for Oliver to verify.
 
 ## Commands
 
 - `pnpm dev`: dev server on port 4050. Spotify rejects `localhost` redirect URIs, so the app is served from `127.0.0.1:4050`; requests to `localhost:4050` are redirected there (`server/middleware/0.canonical-host.ts`) so the login cookie and OAuth callback share a host.
-- `pnpm test`: Vitest (core, crypto, and an end-to-end dry run against fake providers).
+- `pnpm test`: Vitest (core, crypto, cleanup, and an end-to-end pull against fake services).
 - `pnpm typecheck`
 - `pnpm db:generate --name <change>` after editing `server/db/schema.ts`. Migrations apply on server start.
 - `pnpm hash-password '<password>'` prints `APP_PASSWORD_HASH`.

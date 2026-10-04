@@ -46,7 +46,7 @@ async function disconnect(provider: string) {
             </div>
             <p>
               {{ names[c.provider] }} stopped answering<template v-if="c.quota.hitAt"> at {{ formatWhen(c.quota.hitAt) }}</template>.
-              Crossfade sends it nothing until <strong>{{ formatWhen(c.quota.retryAt) }}</strong>, then resumes the sync on its own.
+              Crossfade sends it nothing until <strong>{{ formatWhen(c.quota.retryAt) }}</strong>, then resumes the pull on its own.
             </p>
             <p class="quota-note">
               <template v-if="c.quota.source === 'retry-after'">That time comes from {{ names[c.provider] }} (its Retry-After header).</template>
@@ -67,7 +67,7 @@ async function disconnect(provider: string) {
           <template v-if="c.connected">
             <dt class="label">Account</dt><dd class="mono">{{ c.providerUserId }}</dd>
             <dt class="label">Scopes</dt><dd class="mono fine">{{ c.scopes.join(' ') || 'not reported' }}</dd>
-            <dt class="label">Requests</dt><dd class="mono fine">{{ c.requestsLastRun ?? 0 }} in the latest sync</dd>
+            <dt class="label">Requests</dt><dd class="mono fine">{{ c.requestsLastRun ?? 0 }} in the latest pull</dd>
           </template>
           <dt class="label">Redirect URI</dt><dd class="mono fine">{{ c.redirectUri }}</dd>
         </dl>

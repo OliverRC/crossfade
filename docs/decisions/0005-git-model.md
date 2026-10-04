@@ -16,7 +16,7 @@ The plan bundles everything under "Sync": read both services, match, diff, plan,
 | `status` | Per playlist and service: what the service is missing compared with main (to push), and what main has not taken from it yet (to pull) |
 | merge conflict | A pull that would undo something main changed after that service's last snapshot, such as removing a song the other service just added. The pull stops on that song and asks |
 | `--force-with-lease` | Push re-reads the playlist before writing and writes only what is still needed |
-| `log` | The Runs page: every pull and push with what it changed |
+| `log` | The Activity page: every pull and push with what it changed |
 
 ## Rules
 
@@ -44,6 +44,15 @@ Each button shows its count, for example "Push to Tidal · 12", and every push o
 ## Sync comes later
 
 A one-press "sync" that pulls both services and pushes to both waits until pull and push have earned trust on the real library. Until then there is no automatic push, and nothing is written without Oliver seeing it first. Scheduled pulls are safe, because a pull never writes to a service.
+
+## Implementation notes (M4)
+
+- Main is `memberships` (active, or removed as a tombstone), with `changed_at` and `changed_by` (a service or `user`). Each service has one row in `snapshots` per collection: the base its next pull compares against.
+- A pull that finds a song newly added on a service when main already has it records a **confirm** by that service. That is what turns "removed on Spotify, added on Tidal" into a conflict instead of a silent removal. A first pull confirms nothing, so setting up main raises no conflicts.
+- Tidal reads list items without a country code and keep songs Tidal will not play in Oliver's country, marked unavailable (in one checked playlist, 7 of 125). Before this, those songs silently dropped out of the read, and a pull would have treated them as removed.
+- A playlist that disappears from a service is held as **gone**. Oliver chooses to keep it in main (push would recreate it there) or remove its songs from main.
+- Held collections and conflicts are decided on the Library page; the decisions are stored as changes by `user`.
+- The V0 dry-run sync, its lookup stage and its diff are gone (commit `083c0c4` has them). Lookups return with push.
 
 ## What this replaces
 

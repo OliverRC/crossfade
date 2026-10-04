@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import type { ConnectionView, RunDetail, RunEvent, StageKey } from '~~/shared/types'
-import { STAGES } from '~~/shared/types'
+import { stagesFor } from '~~/shared/types'
 
 const route = useRoute()
 const { data: connections } = await useFetch<ConnectionView[]>('/api/connections')
 const { data: run, refresh, error } = await useFetch<RunDetail>(() => `/api/runs/${route.params.id}`)
 
 // Live: the server bumps `rev` on every stage change or event; refetch at most once a second.
-const progress = useSyncProgress(() => refresh())
+const progress = useRunProgress(() => refresh())
 let pending: ReturnType<typeof setTimeout> | null = null
 watch(() => progress.value?.rev, () => {
   if (progress.value?.runId !== run.value?.id) return
@@ -16,7 +16,8 @@ watch(() => progress.value?.rev, () => {
 const now = useNow(1000)
 
 const live = computed(() => run.value?.status === 'running' && progress.value?.runId === run.value?.id && progress.value?.running)
-const stageLabel = Object.fromEntries(STAGES.map(s => [s.key, s.label])) as Record<StageKey, string>
+const stages = computed(() => (run.value ? stagesFor(run.value) : []))
+const stageLabel = computed(() => Object.fromEntries(stages.value.map(s => [s.key, s.label])) as Record<StageKey, string>)
 const issues = computed(() => (run.value?.events ?? []).filter(e => e.level !== 'info'))
 const filter = ref<'all' | StageKey>('all')
 const events = computed(() => [...(run.value?.events ?? [])].reverse().filter(e => filter.value === 'all' || e.stage === filter.value))
@@ -25,7 +26,8 @@ const levelGlyph: Record<RunEvent['level'], string> = { info: '·', warn: '‖',
 const n = (k: string) => (run.value?.counts?.[k] ?? 0).toLocaleString('en-GB')
 
 async function resume() {
-  await $fetch('/api/sync', { method: 'POST' }).catch(() => {})
+  if (run.value?.kind !== 'pull' || !run.value.provider) return
+  await $fetch(`/api/pull/${run.value.provider}`, { method: 'POST' }).catch(() => {})
   await refresh()
 }
 </script>
@@ -33,22 +35,23 @@ async function resume() {
 <template>
   <main class="page">
     <AppHeader :connections="connections ?? []" />
-    <NuxtLink to="/runs" class="back mono">← All runs</NuxtLink>
+    <NuxtLink to="/activity" class="back mono">← All activity</NuxtLink>
 
-    <p v-if="error" class="banner error">That run does not exist.</p>
+    <p v-if="error" class="banner error">That activity does not exist.</p>
     <template v-else-if="run">
       <section class="card head">
         <div class="head-top">
-          <h1 class="display title">Sync #{{ run.id }}</h1>
+          <h1 class="display title">{{ runTitle(run) }} #{{ run.id }}</h1>
           <span class="pill small" :class="runStatusPill[run.status].cls">{{ live ? 'Running now' : runStatusPill[run.status].label }}</span>
-          <button v-if="run.status === 'paused' || run.status === 'failed'" type="button" class="pill small" @click="resume">Resume now</button>
+          <span v-if="run.kind === 'cleanup'" class="pill small solid-coral">− Wrote to Tidal</span>
+          <button v-if="run.kind === 'pull' && (run.status === 'paused' || run.status === 'failed')" type="button" class="pill small" @click="resume">Resume now</button>
         </div>
         <div class="mono meta">
           <span>Started {{ formatWhen(run.startedAt) }} {{ run.trigger === 'schedule' ? 'automatically' : 'by you' }}</span>
           <span>{{ run.finishedAt ? `Finished ${formatWhen(run.finishedAt)}` : `${elapsed} so far` }}</span>
           <span>{{ run.attempts === 1 ? '1 attempt' : `${run.attempts} attempts` }}</span>
-          <span class="req"><ServiceIcon provider="spotify" :size="12" /> {{ n('spotifyRequests') }} requests</span>
-          <span class="req"><ServiceIcon provider="tidal" :size="12" /> {{ n('tidalRequests') }} requests</span>
+          <span v-if="run.provider !== 'tidal'" class="req"><ServiceIcon provider="spotify" :size="12" /> {{ n('spotifyRequests') }} requests</span>
+          <span v-if="run.provider !== 'spotify'" class="req"><ServiceIcon provider="tidal" :size="12" /> {{ n('tidalRequests') }} requests</span>
         </div>
         <div class="bar"><span :style="{ width: `${Math.round(runProgress(run) * 100)}%` }" :class="run.status" /></div>
         <p v-if="live && progress?.message" class="mono now">{{ progress.message }}<template v-if="progress.total"> · {{ progress.done }}/{{ progress.total }}</template></p>
@@ -65,7 +68,7 @@ async function resume() {
         <section class="card">
           <h2 class="label section-title">Stages</h2>
           <ol class="stages">
-            <li v-for="s in STAGES" :key="s.key" class="stage" :class="run.stages[s.key]?.status ?? 'waiting'">
+            <li v-for="s in stages" :key="s.key" class="stage" :class="run.stages[s.key]?.status ?? 'waiting'">
               <StageGlyph :status="run.stages[s.key]?.status ?? 'waiting'" />
               <div class="stage-body">
                 <div class="stage-top">
@@ -106,7 +109,7 @@ async function resume() {
               <h2 class="label section-title">Log</h2>
               <select v-model="filter" class="mono" aria-label="Filter by stage">
                 <option value="all">All stages</option>
-                <option v-for="s in STAGES" :key="s.key" :value="s.key">{{ s.label }}</option>
+                <option v-for="s in stages" :key="s.key" :value="s.key">{{ s.label }}</option>
               </select>
             </div>
             <ul class="events log">

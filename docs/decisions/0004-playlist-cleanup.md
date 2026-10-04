@@ -37,6 +37,8 @@ Oliver's rule: the kept playlist is the combination of every playable song of ev
 
 Afterwards the local state follows: the kept playlist's saved fetch gains the spares' tracks, the deleted playlists leave the saved fetches, and if a deleted copy was the one paired with Spotify, the kept copy takes over that pairing.
 
+Each cleanup is an Activity entry ("Clean up Tidal", marked as having written to Tidal) with a line per playlist. In M5 a cleanup should become a change to main that Push to Tidal carries out, so playlist deletions go through push like every other write (0005).
+
 Cleanup and sync share one lock (`server/jobs/lock.ts`); a scheduled resume that finds a cleanup running retries a minute later.
 
 Not done: tiers 2 and 3, Spotify (it has no duplicates; Spotify deletes are unfollows), and restoring from a backup, which needs `createPlaylist` from M5.

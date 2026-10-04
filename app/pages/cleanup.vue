@@ -106,7 +106,7 @@ const later = computed(() => [
         <span class="label">Playlist cleanup</span>
         <h1 class="display title">Cleanup</h1>
         <p class="muted intro">
-          Duplicate and empty playlists, found in the playlists from your latest sync
+          Duplicate and empty playlists, found in the playlists from your latest Tidal pull
           <template v-if="view?.sources.tidal">(Tidal read {{ formatWhen(view.sources.tidal.fetchedAt) }})</template>.
           Copies are grouped by name and compared by ISRC. Before changing anything, Crossfade reads each group again from Tidal.
           It deletes a copy only after the kept playlist holds every track of every copy, and saves the copy first.
@@ -134,7 +134,7 @@ const later = computed(() => [
     </div>
 
     <div v-if="startError" class="banner error" role="alert">{{ startError }}</div>
-    <div v-if="!view?.sources.tidal" class="banner pause">Run a sync first: cleanup works from the Tidal playlists it fetched.</div>
+    <div v-if="!view?.sources.tidal" class="banner pause">Pull Tidal first: cleanup works from the playlists it read.</div>
 
     <section v-if="job" class="card section" aria-live="polite">
       <div class="section-head">
@@ -144,7 +144,7 @@ const later = computed(() => [
         </span>
       </div>
       <div v-if="job.error" class="banner error">{{ job.error }}</div>
-      <div v-if="!running && jobCounts.deleted" class="banner ok">Sync again to refresh the library diff.</div>
+      <div v-if="!running && jobCounts.deleted" class="banner ok">Pull Tidal again to bring main up to date.</div>
       <ul class="list">
         <li v-for="o in job.outcomes" :key="o.key" class="row outcome">
           <span class="badge" :class="outcomeBadge[o.status].cls" role="img" :aria-label="outcomeBadge[o.status].label">{{ outcomeBadge[o.status].glyph }}</span>

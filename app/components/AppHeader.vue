@@ -10,7 +10,7 @@ const nav = [
   { to: null, label: 'Review', note: 'M3' },
   { to: null, label: 'Unmatched', note: 'M3' },
   { to: '/cleanup', label: 'Cleanup' },
-  { to: '/runs', label: 'Runs' },
+  { to: '/activity', label: 'Activity' },
   { to: '/connections', label: 'Connections' },
 ]
 

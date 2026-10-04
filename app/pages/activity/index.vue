@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import type { ConnectionView, RunSummary } from '~~/shared/types'
-import { STAGES } from '~~/shared/types'
+import { stagesFor } from '~~/shared/types'
 
 const { data: connections } = await useFetch<ConnectionView[]>('/api/connections')
 const { data: runs, refresh } = await useFetch<RunSummary[]>('/api/runs')
-const progress = useSyncProgress(() => refresh())
+const progress = useRunProgress(() => refresh())
 let pending: ReturnType<typeof setTimeout> | null = null
 watch(() => progress.value?.rev, () => { pending ??= setTimeout(() => { pending = null; refresh() }, 1000) })
 
@@ -14,29 +14,45 @@ const total = (r: RunSummary, k: string) => (r.counts?.[k] ?? 0).toLocaleString(
 <template>
   <main class="page">
     <AppHeader :connections="connections ?? []" />
-    <h1 class="display title">Runs</h1>
-    <p class="muted intro">Every sync, stage by stage. A sync only plans: nothing here wrote to Spotify or Tidal.</p>
+    <h1 class="display title">Activity</h1>
+    <p class="muted intro">Every pull and cleanup, newest first. A pull only reads one service and updates main. Entries marked <strong>Wrote to Tidal</strong> changed your Tidal library.</p>
 
-    <p v-if="!runs?.length" class="muted">No syncs yet.</p>
+    <p v-if="!runs?.length" class="muted">Nothing yet.</p>
     <div class="list">
-      <NuxtLink v-for="r in runs" :key="r.id" :to="`/runs/${r.id}`" class="card run">
+      <NuxtLink v-for="r in runs" :key="r.id" :to="`/activity/${r.id}`" class="card run">
         <div class="run-head">
-          <span class="display run-id">#{{ r.id }}</span>
+          <span class="display run-id"><ServiceIcon v-if="r.provider" :provider="r.provider" :size="16" /> {{ runTitle(r) }} #{{ r.id }}</span>
           <span class="pill small" :class="runStatusPill[r.status].cls">{{ runStatusPill[r.status].label }}</span>
+          <span v-if="r.kind === 'cleanup'" class="pill small solid-coral">− Wrote to Tidal</span>
           <span class="mono muted when">{{ formatWhen(r.startedAt) }} · {{ r.trigger === 'schedule' ? 'automatic' : 'manual' }}<template v-if="r.attempts > 1"> · {{ r.attempts }} attempts</template></span>
         </div>
         <div class="stages" aria-hidden="true">
-          <span v-for="s in STAGES" :key="s.key" class="stage-dot" :class="r.stages[s.key]?.status ?? 'waiting'" :title="s.label" />
+          <span v-for="s in stagesFor(r)" :key="s.key" class="stage-dot" :class="r.stages[s.key]?.status ?? 'waiting'" :title="s.label" />
           <span class="mono now">{{ activeStage(r)?.label ?? (r.status === 'succeeded' ? 'All stages done' : '') }}<template v-if="r.status === 'paused' && r.pause"> · resumes {{ formatWhen(r.pause.resumeAt) }}</template></span>
         </div>
         <div class="bar"><span :style="{ width: `${Math.round(runProgress(r) * 100)}%` }" :class="r.status" /></div>
         <div class="mono stats">
-          <span>{{ total(r, 'add') }} adds</span>
-          <span>{{ total(r, 'review') }} reviews</span>
-          <span>{{ total(r, 'pending') }} not checked</span>
-          <span>{{ total(r, 'unmatched') }} unmatched</span>
-          <span class="req"><ServiceIcon provider="spotify" :size="12" /> {{ total(r, 'spotifyRequests') }}</span>
-          <span class="req"><ServiceIcon provider="tidal" :size="12" /> {{ total(r, 'tidalRequests') }}</span>
+          <template v-if="r.kind === 'pull'">
+            <span>{{ total(r, 'added') }} added</span>
+            <span>{{ total(r, 'removed') }} removed</span>
+            <span>{{ total(r, 'conflicts') }} conflicts</span>
+            <span>{{ total(r, 'held') }} held</span>
+          </template>
+          <template v-else-if="r.kind === 'cleanup'">
+            <span>{{ total(r, 'merged') }} merged</span>
+            <span>{{ total(r, 'deleted') }} deleted</span>
+            <span>{{ total(r, 'added') }} songs added</span>
+            <span>{{ total(r, 'skipped') }} skipped</span>
+            <span>{{ total(r, 'failed') }} failed</span>
+          </template>
+          <template v-else>
+            <span>{{ total(r, 'add') }} adds</span>
+            <span>{{ total(r, 'review') }} reviews</span>
+            <span>{{ total(r, 'pending') }} not checked</span>
+            <span>{{ total(r, 'unmatched') }} unmatched</span>
+          </template>
+          <span v-if="r.provider !== 'tidal'" class="req"><ServiceIcon provider="spotify" :size="12" /> {{ total(r, 'spotifyRequests') }}</span>
+          <span v-if="r.provider !== 'spotify'" class="req"><ServiceIcon provider="tidal" :size="12" /> {{ total(r, 'tidalRequests') }}</span>
         </div>
         <p v-if="r.status === 'failed' && r.error" class="mono error">{{ r.error }}</p>
       </NuxtLink>

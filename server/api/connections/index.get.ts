@@ -1,4 +1,4 @@
-import { desc, eq } from 'drizzle-orm'
+import { and, desc, eq } from 'drizzle-orm'
 import { PROVIDERS, type ConnectionView } from '../../../shared/types'
 import { getAccount } from '../../utils/accounts'
 import { providerCredentials, redirectUri } from '../../utils/config'
@@ -8,10 +8,9 @@ import { schema, useDb } from '../../utils/db'
 const SHOW_CLEARED_FOR_MS = 24 * 3600_000
 
 export default defineEventHandler((): ConnectionView[] => {
-  const latestRun = useDb().select({ counts: schema.syncRuns.counts }).from(schema.syncRuns)
-    .where(eq(schema.syncRuns.kind, 'sync')).orderBy(desc(schema.syncRuns.id)).limit(1).get()
-
   return PROVIDERS.map((provider) => {
+    const latestRun = useDb().select({ counts: schema.syncRuns.counts }).from(schema.syncRuns)
+      .where(and(eq(schema.syncRuns.kind, 'pull'), eq(schema.syncRuns.provider, provider))).orderBy(desc(schema.syncRuns.id)).limit(1).get()
     const account = getAccount(provider)
     const retryAt = account?.quotaBlockedUntil
     const recent = retryAt && Date.now() - Date.parse(retryAt) < SHOW_CLEARED_FOR_MS

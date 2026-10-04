@@ -69,24 +69,33 @@ export function createTidal(country: string): MusicProvider {
 
   const trackIdsOf = (data: any[]) => data.filter(r => r?.type === 'tracks').map(r => String(r.id))
 
+  /**
+   * Every track in a list, as stored. The list is read without a country code so songs Tidal no longer offers
+   * still appear, marked unavailable, rather than vanishing and looking like a removal.
+   */
+  async function readTracks(path: string): Promise<ProviderTrack[]> {
+    const { data, included } = await pages(path, { include: ['items'] })
+    const ids = trackIdsOf(data)
+    const stored = new Map(toTidalTracks(included, []).map(t => [t.providerTrackId, t]))
+    const playable = new Map((await hydrate(ids)).map(t => [t.providerTrackId, t]))
+    return ids.flatMap((id) => {
+      const t = playable.get(id) ?? (stored.has(id) ? { ...stored.get(id)!, available: false } : undefined)
+      return t ? [t] : []
+    })
+  }
+
   return {
     id: 'tidal',
     isrcBatchSize: 20,
 
-    async getLikedTracks() {
-      const { data } = await pages('/userCollectionTracks/me/relationships/items')
-      return hydrate(trackIdsOf(data))
-    },
+    getLikedTracks: () => readTracks('/userCollectionTracks/me/relationships/items'),
 
     async getOwnedPlaylists() {
       const { data } = await pages('/playlists', { 'filter[owners.id]': 'me', countryCode: country })
       return data.map((p): ProviderPlaylist => ({ providerCollectionId: String(p.id), name: p.attributes?.name ?? '' }))
     },
 
-    async getPlaylistTracks(playlistId) {
-      const { data } = await pages(`/playlists/${playlistId}/relationships/items`, { countryCode: country })
-      return hydrate(trackIdsOf(data))
-    },
+    getPlaylistTracks: playlistId => readTracks(`/playlists/${playlistId}/relationships/items`),
 
     async findByIsrcs(isrcs) {
       const out = new Map<string, ProviderTrack[]>(isrcs.map(i => [i, []]))

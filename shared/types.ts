@@ -10,6 +10,8 @@ export interface ProviderTrack {
   durationMs: number
   explicit: boolean
   version: string | null
+  /** False when the service still lists the song but no longer offers it. Absent means available. */
+  available?: boolean
 }
 
 export interface ProviderPlaylist {
@@ -22,7 +24,8 @@ export type LinkMethod = 'origin' | 'isrc' | 'fuzzy' | 'manual'
 /** no_isrc_match: the ISRC lookup missed and fuzzy search was not tried, so a later pass can still find it. */
 export type UnmatchedReason = 'not_found' | 'no_isrc_match' | 'low_confidence' | 'ignored'
 
-export type RowState = 'in_sync' | 'add' | 'review' | 'pending' | 'unmatched'
+/** A song's overall state on the Library page; each has its own glyph as well as a colour. */
+export type RowState = 'in_sync' | 'add' | 'remove' | 'conflict' | 'unavailable' | 'unknown'
 
 export interface TrackView {
   title: string
@@ -31,34 +34,60 @@ export interface TrackView {
   isrc: string | null
 }
 
-export interface DiffRow {
-  canonicalTrackId: number
-  state: RowState
-  /** The service the change would be written to (absent when in sync). */
-  target?: ProviderId
-  spotify: TrackView | null
-  tidal: TrackView | null
-  /** Fuzzy candidate on the target service, for review rows. */
-  candidate?: TrackView & { score: number }
-  method?: LinkMethod
-  confidence?: number
-  reason?: UnmatchedReason
+export interface StatusCounts {
+  inSync: number
+  conflicts: number
+  /** Per service: songs a push would add and remove, and songs it lists but no longer offers. */
+  add: Record<ProviderId, number>
+  remove: Record<ProviderId, number>
+  unavailable: Record<ProviderId, number>
 }
 
-export interface CollectionDiff {
+export interface StatusRowView {
+  canonicalTrackId: number
+  state: RowState
+  track: TrackView
+  main: 'active' | 'removed'
+  spotify: SideState
+  tidal: SideState
+  conflict: { id: number, provider: ProviderId, change: 'added' | 'removed' } | null
+}
+
+export interface HoldView {
+  id: number
+  provider: ProviderId
+  reason: HoldReason
+  before: number
+  removing: number
+  detectedAt: string
+  runId: number
+}
+
+export interface CollectionStatusView {
   key: string
   kind: 'liked' | 'playlist'
   name: string
-  onSpotify: boolean
-  onTidal: boolean
-  counts: Record<RowState, number> & { total: number }
-  rows: DiffRow[]
+  /** The collection exists on the service. */
+  on: Record<ProviderId, boolean>
+  counts: StatusCounts
+  holds: HoldView[]
 }
 
-export interface SyncResult {
-  runId: number
-  finishedAt: string
-  collections: CollectionDiff[]
+export interface ServiceStatusView {
+  /** When the service was last pulled in full; null before its first pull. */
+  pulledAt: string | null
+  /** The latest pull of this service. */
+  run: RunStatus | null
+}
+
+export interface LibraryView {
+  services: Record<ProviderId, ServiceStatusView>
+  collections: CollectionStatusView[]
+  totals: StatusCounts & { held: number }
+  /** Rows of the requested collection, or the first one. */
+  selected: { key: string, rows: StatusRowView[] } | null
+  /** Songs added or removed in main by each of the last 20 pulls, oldest first. */
+  recent: number[]
 }
 
 export interface QuotaView {
@@ -79,21 +108,38 @@ export interface ConnectionView {
   providerUserId: string | null
   needsReconnect: boolean
   quota: QuotaView | null
-  /** Requests sent to this service by the latest sync run, across its resumes. */
+  /** Requests sent to this service by its latest pull, across its resumes. */
   requestsLastRun: number | null
   scopes: string[]
 }
 
-export type StageKey = 'fetch:spotify' | 'fetch:tidal' | 'link' | 'pair' | 'match:tidal' | 'match:spotify' | 'diff'
-export const STAGES: { key: StageKey, label: string, help: string }[] = [
-  { key: 'fetch:spotify', label: 'Fetch Spotify', help: 'Liked songs and every playlist you own, saved as each one arrives.' },
-  { key: 'fetch:tidal', label: 'Fetch Tidal', help: 'Liked songs and every playlist you own, saved as each one arrives.' },
-  { key: 'link', label: 'Link tracks', help: 'Every track becomes one canonical record; equal ISRCs on both services share one.' },
-  { key: 'pair', label: 'Pair playlists', help: 'Liked songs with liked songs; playlists by a previous pairing or by name.' },
-  { key: 'match:tidal', label: 'Match on Tidal', help: 'Find Spotify-only tracks on Tidal by ISRC, 20 per request.' },
-  { key: 'match:spotify', label: 'Match on Spotify', help: 'Find Tidal-only tracks on Spotify by ISRC. Rationed: Spotify has a quota.' },
-  { key: 'diff', label: 'Build the diff', help: 'What a merge would add on each side. Nothing is written.' },
-]
+export type StageKey = 'fetch:spotify' | 'fetch:tidal' | 'link' | 'pair' | 'match:tidal' | 'match:spotify' | 'diff' | 'merge' | 'cleanup'
+export interface StageInfo { key: StageKey, label: string, help: string }
+
+const STAGE_INFO: Record<StageKey, Omit<StageInfo, 'key'>> = {
+  'fetch:spotify': { label: 'Fetch Spotify', help: 'Liked songs and every playlist you own, saved as each one arrives.' },
+  'fetch:tidal': { label: 'Fetch Tidal', help: 'Liked songs and every playlist you own, saved as each one arrives. Songs Tidal lists but will not play in your country are kept, marked unavailable.' },
+  'link': { label: 'Link tracks', help: 'Every track becomes one canonical record; equal ISRCs on both services share one.' },
+  'pair': { label: 'Pair playlists', help: 'Liked songs with liked songs; playlists by a previous pairing or by name.' },
+  'match:tidal': { label: 'Match on Tidal', help: 'Find Spotify-only tracks on Tidal by ISRC, 20 per request.' },
+  'match:spotify': { label: 'Match on Spotify', help: 'Find Tidal-only tracks on Spotify by ISRC. Rationed: Spotify has a quota.' },
+  'diff': { label: 'Build the diff', help: 'What a merge would add on each side. Nothing is written.' },
+  'merge': { label: 'Merge into main', help: 'Changes since the last pull become changes in main. Conflicts and suspicious reads are held for you.' },
+  'cleanup': { label: 'Clean up playlists', help: 'Merge exact copies into the one you keep, then delete the rest; delete empty playlists. Every deleted playlist is saved first.' },
+}
+
+/** cleanup: the playlist cleanup, which writes to Tidal (docs/decisions/0004). */
+export type RunKind = 'sync' | 'apply' | 'pull' | 'push' | 'cleanup'
+
+/** The stages a run goes through: a pull fetches one service; the V0 sync fetched both and matched. */
+export function stagesFor(run: { kind: RunKind, provider: ProviderId | null }): StageInfo[] {
+  const keys: StageKey[] = run.kind === 'cleanup'
+    ? ['cleanup']
+    : run.kind === 'pull' && run.provider
+      ? [`fetch:${run.provider}`, 'link', 'pair', 'merge']
+      : ['fetch:spotify', 'fetch:tidal', 'link', 'pair', 'match:tidal', 'match:spotify', 'diff']
+  return keys.map(key => ({ key, ...STAGE_INFO[key] }))
+}
 
 export type StageStatus = 'waiting' | 'running' | 'done' | 'paused' | 'failed' | 'skipped'
 
@@ -118,6 +164,8 @@ export interface RunEvent {
 
 export interface RunSummary {
   id: number
+  kind: RunKind
+  provider: ProviderId | null
   trigger: 'manual' | 'schedule'
   status: 'running' | 'paused' | 'succeeded' | 'failed'
   startedAt: string
@@ -147,7 +195,6 @@ export interface RunStatus {
   phase: string | null
   pause: RunPause | null
   error: string | null
-  pending: number
 }
 
 export interface RunProgress {
@@ -161,6 +208,8 @@ export interface RunProgress {
   resumeAt: string | null
   /** The run in progress or last run, and a counter bumped on every stage or event change. */
   runId: number | null
+  /** The service the run in progress or last run pulled. */
+  provider: ProviderId | null
   rev: number
 }
 
@@ -255,3 +304,21 @@ export interface PulledSongView {
   playlistUrl: string
   foundAt: string
 }
+
+/** One song in a service's snapshot of a collection. */
+export interface SnapshotItem {
+  canonicalTrackId: number
+  providerTrackId: string
+  /** False when the service lists the song but no longer offers it. */
+  available: boolean
+}
+
+export type HoldReason = 'empty' | 'mass_removal' | 'gone'
+
+/**
+ * A song's state on one service compared with main (docs/decisions/0005).
+ * present: there and in main. missing: in main, not there (a push adds it). extra: removed from main, still there
+ * (a push removes it). unavailable: listed but no longer offered. absent: removed from main and not there.
+ * unknown: the service has not been pulled yet.
+ */
+export type SideState = 'present' | 'missing' | 'extra' | 'unavailable' | 'absent' | 'unknown'

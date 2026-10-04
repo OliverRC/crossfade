@@ -3,7 +3,7 @@ import type { schema } from './db'
 
 export function toRunSummary(r: typeof schema.syncRuns.$inferSelect): RunSummary {
   return {
-    id: r.id, trigger: r.trigger, status: r.status, startedAt: r.startedAt, finishedAt: r.finishedAt,
+    id: r.id, kind: r.kind, provider: r.provider, trigger: r.trigger, status: r.status, startedAt: r.startedAt, finishedAt: r.finishedAt,
     attempts: r.attempts, pause: r.pause, error: r.error, counts: r.counts, stages: r.stages ?? {},
   }
 }

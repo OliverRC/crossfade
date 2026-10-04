@@ -1,17 +1,19 @@
 // Playlist cleanup (docs/decisions/0004): merge exact duplicate copies of a Tidal playlist into one, and remove
 // empty Tidal playlists. The only write path before M5. Each group is read fresh from Tidal before writing, and a
 // copy is deleted only after the kept playlist has been read back and holds every item of every copy.
-import { desc, eq, inArray } from 'drizzle-orm'
+import { and, desc, eq, inArray } from 'drizzle-orm'
 import type { CleanupJobView, CleanupOutcome, CleanupView, DuplicateGroupView, EmptyPlaylistView, PlaylistRef, ProviderId, ProviderTrack } from '../../shared/types'
 import { PROVIDERS } from '../../shared/types'
 import { findDuplicates, mergePlan, missingFrom, type PlaylistItems } from '../core/duplicates'
 import { normaliseText } from '../core/normalise'
-import { QuotaError } from '../providers/http'
+import { QuotaError, requestCounts } from '../providers/http'
 import { createTidalPlaylistEditor, type PlaylistItemRef, type TidalPlaylistEditor } from '../providers/tidal'
 import { getAccount } from '../utils/accounts'
 import { schema, useDb } from '../utils/db'
 import { acquire, release } from './lock'
-import { quotaBlockedUntil } from './sync'
+import { mergeCollection, withRemembered } from './pull'
+import { quotaBlockedUntil } from './quota'
+import { createRunLog, type RunLog } from './run-log'
 
 /** Services cleanup may write to. Spotify duplicates are shown only. */
 const WRITABLE: ProviderId[] = ['tidal']
@@ -34,11 +36,11 @@ interface Fetched {
   playlists: PlaylistItems[]
 }
 
-/** Playlists from the latest sync that fetched every playlist of this service. */
+/** Playlists from the latest pull (or V0 sync) that fetched every playlist of this service. */
 function loadFetched(provider: ProviderId): Fetched | null {
   const db = useDb()
-  const runs = db.select({ id: schema.syncRuns.id, playlists: schema.syncRuns.playlists }).from(schema.syncRuns)
-    .where(eq(schema.syncRuns.kind, 'sync')).orderBy(desc(schema.syncRuns.id)).all()
+  const runs = db.select({ id: schema.syncRuns.id, kind: schema.syncRuns.kind, provider: schema.syncRuns.provider, playlists: schema.syncRuns.playlists }).from(schema.syncRuns)
+    .orderBy(desc(schema.syncRuns.id)).all().filter(r => r.kind === 'sync' || (r.kind === 'pull' && r.provider === provider))
   for (const run of runs) {
     const listed = run.playlists?.[provider]
     if (!listed) continue
@@ -129,7 +131,7 @@ export function startCleanup(selection: CleanupSelection, editor?: TidalPlaylist
   if (blocked) throw new Error(`Tidal is rate limited until ${blocked}`)
 
   const fetched = loadFetched('tidal')
-  if (!fetched) throw new Error('Run a sync first so Crossfade has your Tidal playlists')
+  if (!fetched) throw new Error('Pull Tidal first so Crossfade has your Tidal playlists')
   const report = findDuplicates(fetched.playlists)
   const tasks: Task[] = []
   for (const m of selection.merges) {
@@ -147,6 +149,10 @@ export function startCleanup(selection: CleanupSelection, editor?: TidalPlaylist
   if (!tasks.length) throw new Error('Nothing selected')
   if (!acquire('cleanup')) throw new Error('A sync or cleanup is running; try again when it finishes')
 
+  // Every cleanup is an Activity entry: it writes to Tidal.
+  const activity = useDb().insert(schema.syncRuns).values({
+    kind: 'cleanup', provider: 'tidal', trigger: 'manual', startedAt: new Date().toISOString(), status: 'running', attempts: 1, stages: {},
+  }).returning({ id: schema.syncRuns.id }).get()
   job = {
     running: true,
     startedAt: new Date().toISOString(),
@@ -154,7 +160,7 @@ export function startCleanup(selection: CleanupSelection, editor?: TidalPlaylist
     error: null,
     outcomes: tasks.map((t): CleanupOutcome => ({ key: t.key, kind: t.kind, name: t.name, status: 'queued', detail: null, added: 0, deleted: 0, pulled: 0 })),
   }
-  run(tasks, job, tidal).finally(() => release('cleanup'))
+  run(tasks, job, tidal, createRunLog(activity.id), activity.id).finally(() => release('cleanup'))
   return job
 }
 
@@ -164,32 +170,58 @@ type Task =
 
 class Skip extends Error {}
 
-async function run(tasks: Task[], state: CleanupJobView, tidal: TidalPlaylistEditor) {
+async function run(tasks: Task[], state: CleanupJobView, tidal: TidalPlaylistEditor, log: RunLog, activityId: number) {
+  const startRequests = requestCounts.tidal
+  log.stage('cleanup', { status: 'running', done: 0, total: tasks.length, detail: null })
+  log.event('info', 'cleanup', `Started by you: ${tasks.filter(t => t.kind === 'merge').length} merges and ${tasks.filter(t => t.kind === 'empty').length} empty playlists on Tidal`)
   for (const [i, task] of tasks.entries()) {
     const outcome = state.outcomes[i]!
     outcome.status = 'running'
+    log.stage('cleanup', { detail: `"${task.name}"` })
     try {
       if (task.kind === 'merge') await merge(tidal, task, outcome)
       else await removeEmpty(tidal, task, outcome)
       outcome.status = 'done'
+      log.event('info', 'cleanup', task.kind === 'merge'
+        ? `Merged "${task.name}": ${outcome.detail}; deleted ${outcome.deleted === 1 ? 'the other copy' : `${outcome.deleted} copies`} from Tidal, saved first`
+        : `Deleted the empty playlist "${task.name}" from Tidal, saved first`)
     } catch (error) {
       if (error instanceof Skip) {
         outcome.status = 'skipped'
         outcome.detail = error.message
+        log.event('info', 'cleanup', `Skipped "${task.name}": ${error.message}`)
         continue
       }
       outcome.status = 'failed'
       outcome.detail = (error as Error).message
+      log.event('error', 'cleanup', `Failed "${task.name}": ${outcome.detail}`)
       if (error instanceof QuotaError) {
         // Tidal asked for a long wait: stop rather than hammer it. Nothing half-done is deleted.
         for (const rest of state.outcomes.slice(i + 1)) { rest.status = 'not_attempted'; rest.detail = 'Stopped: Tidal is rate limiting' }
         state.error = error.message
         break
       }
+    } finally {
+      log.stage('cleanup', { done: i + 1 })
     }
   }
   state.running = false
   state.finishedAt = new Date().toISOString()
+
+  const tally = (status: CleanupOutcome['status']) => state.outcomes.filter(o => o.status === status).length
+  const counts = {
+    merged: state.outcomes.filter(o => o.kind === 'merge' && o.status === 'done').length,
+    deleted: state.outcomes.reduce((n, o) => n + o.deleted, 0),
+    added: state.outcomes.reduce((n, o) => n + o.added, 0),
+    pulled: state.outcomes.reduce((n, o) => n + o.pulled, 0),
+    skipped: tally('skipped'),
+    failed: tally('failed'),
+    tidalRequests: requestCounts.tidal - startRequests,
+  }
+  log.stage('cleanup', { status: state.error ? 'failed' : 'done', detail: `${counts.deleted} deleted from Tidal, ${counts.added} songs added, ${counts.skipped} skipped, ${counts.failed} failed` })
+  log.flush()
+  useDb().update(schema.syncRuns).set({ status: state.error ? 'failed' : 'succeeded', finishedAt: state.finishedAt, error: state.error, counts })
+    .where(eq(schema.syncRuns.id, activityId)).run()
 }
 
 interface FreshCopy extends PlaylistItems {
@@ -336,4 +368,26 @@ function forgetPlaylists(provider: ProviderId, deletedIds: string[], keeperId: s
     const orphans = touched.filter(id => !stillLinked.has(id))
     if (orphans.length) tx.delete(schema.collections).where(inArray(schema.collections.id, orphans)).run()
   })
+  if (keeperId) recordKept(provider, keeperId)
+}
+
+/**
+ * Main learns what the kept playlist holds now, as a pull would: the copies' songs merge into its collection and the
+ * service's snapshot moves to the merged playlist. Without this, main would think the service holds none of them,
+ * and a push would add them all again. Nothing to do before the service's first pull.
+ */
+function recordKept(provider: ProviderId, keeperId: string) {
+  const db = useDb()
+  if (!db.select({ id: schema.snapshots.id }).from(schema.snapshots).where(eq(schema.snapshots.provider, provider)).get()) return
+  const link = db.select().from(schema.collectionLinks)
+    .where(and(eq(schema.collectionLinks.provider, provider), eq(schema.collectionLinks.providerCollectionId, keeperId))).get()
+  const kept = db.select().from(schema.fetchCheckpoints).where(eq(schema.fetchCheckpoints.collectionKey, keeperId)).all()
+    .filter(c => c.provider === provider).sort((a, b) => b.runId - a.runId)[0]
+  if (!link || !kept) return
+  const canonical = new Map(db.select().from(schema.trackLinks).where(eq(schema.trackLinks.provider, provider)).all()
+    .filter(l => l.providerTrackId).map(l => [l.providerTrackId!, l.canonicalTrackId]))
+  const items = kept.tracks.flatMap(t => canonical.has(t.providerTrackId)
+    ? [{ canonicalTrackId: canonical.get(t.providerTrackId)!, providerTrackId: t.providerTrackId, available: t.available !== false }]
+    : [])
+  mergeCollection({ provider, collectionId: link.collectionId, providerCollectionId: keeperId, items: withRemembered(provider, keeperId, items), runId: kept.runId, acceptRemovals: true })
 }

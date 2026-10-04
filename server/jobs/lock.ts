@@ -1,5 +1,5 @@
-// One job at a time: a sync and a playlist cleanup never overlap, because cleanup edits what a sync reads.
-export type Job = 'sync' | 'cleanup'
+// One job at a time: a pull and a playlist cleanup never overlap, because cleanup edits what a pull reads.
+export type Job = 'pull' | 'push' | 'cleanup'
 
 let holder: Job | null = null
 
