@@ -57,14 +57,20 @@ export function createTidal(country: string): MusicProvider {
 
   const pages = (path: string, query: Record<string, string | string[]> = {}) => readAll(request, path, query)
 
+  /**
+   * Tracks already fetched by this provider instance (one pull), null when Tidal does not offer it in the country.
+   * A song in liked and in several playlists is fetched once, not once per collection.
+   */
+  const hydrated = new Map<string, ProviderTrack | null>()
+
   /** Full track objects with artists and album, 20 IDs per call. Preserves input order. */
   async function hydrate(ids: string[]): Promise<ProviderTrack[]> {
-    const found = new Map<string, ProviderTrack>()
-    for (const batch of chunk([...new Set(ids)], 20)) {
+    for (const batch of chunk([...new Set(ids)].filter(id => !hydrated.has(id)), 20)) {
       const res: any = await request('/tracks', { query: { 'filter[id]': batch, include: ['artists', 'albums'], countryCode: country } })
-      for (const t of toTidalTracks(res.data ?? [], res.included ?? [])) found.set(t.providerTrackId, t)
+      for (const id of batch) hydrated.set(id, null)
+      for (const t of toTidalTracks(res.data ?? [], res.included ?? [])) hydrated.set(t.providerTrackId, t)
     }
-    return ids.map(id => found.get(id)).filter((t): t is ProviderTrack => t !== undefined)
+    return ids.map(id => hydrated.get(id)).filter((t): t is ProviderTrack => Boolean(t))
   }
 
   const trackIdsOf = (data: any[]) => data.filter(r => r?.type === 'tracks').map(r => String(r.id))
