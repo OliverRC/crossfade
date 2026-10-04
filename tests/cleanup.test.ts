@@ -189,8 +189,21 @@ describe('playlist cleanup', () => {
     expect(filled.writes).toEqual([])
   })
 
-  it('refuses groups that are not exact copies', () => {
+  it('merges same-named playlists with different tracks when chosen: the kept one gets every song', async () => {
+    seed({ a: { name: 'Lo-Fi', tracks: nums(1, 10) }, b: { name: 'Lo-Fi', tracks: nums(8, 20) } })
+    expect(cleanup.cleanupView().groups).toMatchObject([{ tier: 'different', actionable: true }])
+    const tidal = fakeTidal({ a: { name: 'Lo-Fi', items: nums(1, 10).map(ref) }, b: { name: 'Lo-Fi', items: nums(8, 20).map(ref) } })
+    const job = await finished(cleanup.startCleanup({ merges: [{ key: groupKey('a', 'b'), keeperId: 'b' }], empties: [] }, tidal.editor))
+
+    expect(job.outcomes[0]).toMatchObject({ status: 'done', added: 7, deleted: 1 })
+    expect(tidal.playlists.b!.items.map(i => i.id).sort()).toEqual(nums(1, 20).map(n => `id${n}`).sort())
+    expect(tidal.playlists.a).toBeUndefined()
+  })
+
+  it('merges one copy inside another when chosen', async () => {
     seed({ a: { name: 'Heavy', tracks: nums(1, 7) }, b: { name: 'Heavy', tracks: nums(1, 9) } })
-    expect(() => cleanup.startCleanup({ merges: [{ key: groupKey('a', 'b'), keeperId: 'b' }], empties: [] }, fakeTidal({}).editor)).toThrow(/not an exact copy/)
+    const tidal = fakeTidal({ a: { name: 'Heavy', items: nums(1, 7).map(ref) }, b: { name: 'Heavy', items: nums(1, 9).map(ref) } })
+    const job = await finished(cleanup.startCleanup({ merges: [{ key: groupKey('a', 'b'), keeperId: 'b' }], empties: [] }, tidal.editor))
+    expect(job.outcomes[0]).toMatchObject({ status: 'done', added: 0, deleted: 1 })
   })
 })

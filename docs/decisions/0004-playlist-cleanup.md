@@ -11,8 +11,8 @@ Tiers, compared per service by ISRC (the service's own ID when there is no ISRC)
 | Tier | Rule | Action |
 | --- | --- | --- |
 | Exact copies | Items in every copy are at least 90% of the largest copy | Merge: keep one, delete the rest |
-| One contains the other | Every copy has at least 90% of its items in the largest copy | Shown only |
-| Same name, different tracks | Neither | Shown only |
+| One contains the other | Every copy has at least 90% of its items in the largest copy | Merge when Oliver ticks it (2026-10-04) |
+| Same name, different tracks | Neither | Merge when Oliver ticks it (2026-10-04) |
 | Empty | No items, whatever the name | Delete |
 
 Overlap without a matching name is not a duplicate: the only such pair found was a 2-track playlist inside a 92-track one.
@@ -20,7 +20,7 @@ Overlap without a matching name is not a duplicate: the only such pair found was
 Safety, in order, per group:
 
 1. Read every copy fresh from Tidal, without a country code so nothing region-unavailable is hidden. If the returned count differs from the playlist's `numberOfItems`, stop.
-2. Re-check the names and the tier on the fresh data; skip the group if it is no longer exact copies.
+2. Re-check the names and the tier on the fresh data; skip the group if its copies are now further apart than the tier Oliver chose to merge.
 3. Add what the kept copy lacks (`onDuplicates: SKIP`, `Idempotency-Key` per batch).
 4. Read the kept copy back. Delete nothing unless it holds every playable song of every copy (see Pulled songs).
 5. Save each spare (name, description, access type, items) in `playlist_backups`, then delete it.
@@ -41,4 +41,6 @@ Each cleanup is an Activity entry ("Clean up Tidal", marked as having written to
 
 Cleanup and sync share one lock (`server/jobs/lock.ts`); a scheduled resume that finds a cleanup running retries a minute later.
 
-Not done: tiers 2 and 3, Spotify (it has no duplicates; Spotify deletes are unfollows), and restoring from a backup, which needs `createPlaylist` from M5.
+Update 2026-10-04: tiers 2 and 3 merge too. A merge never loses a song (the kept copy gets the union), and the Library showed every one of these as a second playlist that M5 would create on Spotify, with nothing Oliver could do about it. Exact copies start ticked; the other two start unticked, since same-named playlists with different songs may be meant to stay apart. Each group says in words what the merge keeps, adds and deletes.
+
+Not done: Spotify (it has no duplicates; Spotify deletes are unfollows), and restoring from a backup, which needs `createPlaylist` from M5.

@@ -4,7 +4,7 @@
 import { and, desc, eq, inArray } from 'drizzle-orm'
 import type { CleanupJobView, CleanupOutcome, CleanupView, DuplicateGroupView, EmptyPlaylistView, PlaylistRef, ProviderId, ProviderTrack } from '../../shared/types'
 import { PROVIDERS } from '../../shared/types'
-import { findDuplicates, mergePlan, missingFrom, type PlaylistItems } from '../core/duplicates'
+import { findDuplicates, mergePlan, missingFrom, type DuplicateTier, type PlaylistItems } from '../core/duplicates'
 import { normaliseText } from '../core/normalise'
 import { QuotaError, requestCounts } from '../providers/http'
 import { createTidalPlaylistEditor, type PlaylistItemRef, type TidalPlaylistEditor } from '../providers/tidal'
@@ -86,7 +86,7 @@ export function cleanupView(): CleanupView {
         name: g.name,
         shared: g.shared,
         union: g.union,
-        actionable: actionable && g.tier === 'exact',
+        actionable,
         counterpart: counterpart(provider, g.name),
         copies: g.copies.map((c) => {
           const others = new Set(g.copies.filter(o => o !== c).flatMap(o => o.items))
@@ -138,9 +138,8 @@ export function startCleanup(selection: CleanupSelection, editor?: TidalPlaylist
   for (const m of selection.merges) {
     const group = report.groups.find(g => groupKey('tidal', g.copies) === m.key)
     if (!group) throw new Error(`Unknown duplicate group ${m.key}`)
-    if (group.tier !== 'exact') throw new Error(`"${group.name}" is not an exact copy; only exact copies are merged`)
     if (!group.copies.some(c => c.id === m.keeperId)) throw new Error(`The playlist to keep is not one of the "${group.name}" copies`)
-    tasks.push({ kind: 'merge', key: m.key, name: group.name, ids: group.copies.map(c => c.id), keeperId: m.keeperId })
+    tasks.push({ kind: 'merge', key: m.key, name: group.name, ids: group.copies.map(c => c.id), keeperId: m.keeperId, tier: group.tier })
   }
   for (const key of selection.empties) {
     const p = report.empty.find(e => `tidal:${e.id}` === key)
@@ -166,10 +165,14 @@ export function startCleanup(selection: CleanupSelection, editor?: TidalPlaylist
 }
 
 type Task =
-  | { kind: 'merge', key: string, name: string, ids: string[], keeperId: string }
+  /** tier: how alike the copies were when Oliver chose to merge them. */
+  | { kind: 'merge', key: string, name: string, ids: string[], keeperId: string, tier: DuplicateTier }
   | { kind: 'empty', key: string, name: string, ids: string[] }
 
 class Skip extends Error {}
+
+const TIER_RANK: Record<DuplicateTier, number> = { exact: 0, contained: 1, different: 2 }
+const TIER_TEXT: Record<DuplicateTier, string> = { exact: 'copies', contained: 'one inside the other', different: 'different tracks' }
 
 async function run(tasks: Task[], state: CleanupJobView, tidal: TidalPlaylistEditor, log: RunLog, activityId: number) {
   const startRequests = requestCounts.tidal
@@ -247,8 +250,11 @@ async function merge(tidal: TidalPlaylistEditor, task: Extract<Task, { kind: 'me
 
   // Re-check against what Tidal holds now, not the sync's snapshot.
   if (new Set(copies.map(c => normaliseText(c.name))).size > 1) throw new Skip('A copy was renamed since the last sync')
+  // Merging never loses a song, but copies that drifted further apart than Oliver saw are his call again.
   const tier = findDuplicates(copies).groups[0]?.tier
-  if (tier !== 'exact') throw new Skip(`No longer exact copies on Tidal (now ${tier ?? 'not a duplicate'}); nothing was changed`)
+  if (!tier || TIER_RANK[tier] > TIER_RANK[task.tier]) {
+    throw new Skip(`Changed on Tidal since the last pull (was ${TIER_TEXT[task.tier]}, now ${tier ? TIER_TEXT[tier] : 'not a duplicate'}); nothing was changed`)
+  }
 
   const plan = mergePlan(copies, task.keeperId)
   const refByKey = new Map<string, PlaylistItemRef>()

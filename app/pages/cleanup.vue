@@ -11,16 +11,17 @@ const startError = ref<string | null>(null)
 const starting = ref(false)
 
 const groups = (tier: DuplicateTier) => (view.value?.groups ?? []).filter(g => g.tier === tier)
-const exact = computed(() => groups('exact'))
+const allGroups = computed(() => view.value?.groups ?? [])
 const empties = computed(() => view.value?.empty ?? [])
 const job = computed(() => view.value?.job ?? null)
 const running = computed(() => job.value?.running ?? false)
 
-// Exact copies and empty playlists start selected; the confirmation still lists what will be deleted.
+// Exact copies and empty playlists start selected; the other duplicates are Oliver's call, so they start unticked.
+// The confirmation still lists what will be deleted.
 watch(view, (v) => {
   for (const g of v?.groups ?? []) {
     if (!g.actionable) continue
-    merge.value[g.key] ??= true
+    merge.value[g.key] ??= g.tier === 'exact'
     keeper.value[g.key] ??= g.copies[0]!.id
   }
   for (const e of v?.empty ?? []) if (e.actionable) removeEmpty.value[e.key] ??= true
@@ -33,7 +34,7 @@ watch(running, (now) => {
 }, { immediate: true })
 onBeforeUnmount(() => { if (poll) clearInterval(poll) })
 
-const selectedMerges = computed(() => exact.value.filter(g => g.actionable && merge.value[g.key]))
+const selectedMerges = computed(() => allGroups.value.filter(g => g.actionable && merge.value[g.key]))
 const selectedEmpties = computed(() => empties.value.filter(e => e.actionable && removeEmpty.value[e.key]))
 const deletions = computed(() => selectedMerges.value.reduce((n, g) => n + g.copies.length - 1, 0) + selectedEmpties.value.length)
 const additions = computed(() => selectedMerges.value.reduce((n, g) => n + kept(g).afterIfKept - kept(g).items, 0))
@@ -43,14 +44,14 @@ const plural = (n: number, word: string) => `${n.toLocaleString('en-GB')} ${word
 const providerName = { spotify: 'Spotify', tidal: 'Tidal' } as const
 
 function setAll(on: boolean) {
-  for (const g of exact.value) if (g.actionable) merge.value[g.key] = on
+  for (const g of allGroups.value) if (g.actionable) merge.value[g.key] = on
   for (const e of empties.value) if (e.actionable) removeEmpty.value[e.key] = on
 }
 
 async function start() {
   startError.value = null
   const lines = [
-    `Merge ${plural(selectedMerges.value.length, 'group')} of exact copies and remove ${plural(selectedEmpties.value.length, 'empty playlist')} on Tidal?`,
+    `Merge ${plural(selectedMerges.value.length, 'group')} of same-named playlists and remove ${plural(selectedEmpties.value.length, 'empty playlist')} on Tidal?`,
     '',
     `${plural(deletions.value, 'Tidal playlist')} will be deleted, and ${plural(additions.value, 'track')} added to the copies you keep.`,
     'Each group is read again from Tidal first. A copy is deleted only after the kept playlist holds every track of every copy, and is saved in Crossfade before it goes.',
@@ -91,10 +92,38 @@ const jobCounts = computed(() => {
   return c
 })
 
-const later = computed(() => [
-  { tier: 'contained' as const, title: 'One copy contains the other', note: 'The larger copy already holds at least 90% of every other copy. Not merged yet.', glyph: '⊂', cls: 'b-amber', groups: groups('contained') },
-  { tier: 'different' as const, title: 'Same name, different tracks', note: 'These look like separate playlists that share a name. Not merged yet.', glyph: '≠', cls: 'b-outline', groups: groups('different') },
+/** The three kinds of same-named playlists, most alike first. Each says plainly what a merge does. */
+const sections = computed(() => [
+  {
+    tier: 'exact' as const, glyph: '=', cls: 'b-mint',
+    title: 'Copies of the same playlist',
+    note: 'Nearly every song is in every copy, usually because an import ran twice. Ticked for you.',
+    groups: groups('exact'),
+  },
+  {
+    tier: 'contained' as const, glyph: '⊂', cls: 'b-amber',
+    title: 'One copy is an older, shorter version',
+    note: 'The bigger copy already has (almost) every song of the smaller one. Merging keeps one playlist and adds the few songs only the other has. Not ticked: your call.',
+    groups: groups('contained'),
+  },
+  {
+    tier: 'different' as const, glyph: '≠', cls: 'b-outline',
+    title: 'Same name, mostly different songs',
+    note: 'These may be separate playlists that happen to share a name. Merging makes them one playlist with every song from each. Leave them unticked to keep both.',
+    groups: groups('different'),
+  },
 ])
+
+/** Plain words for what merging this group does, with the copy currently chosen as the keeper. */
+function outcome(g: DuplicateGroupView): string {
+  const k = kept(g)
+  const added = k.afterIfKept - k.items
+  const others = g.copies.filter(c => c !== k)
+  const deleted = others.map(c => `the ${c.items}-song copy`).join(' and ')
+  return `Keep the ${k.items}-song copy${added ? `, add the ${plural(added, 'song')} only the other ${others.length === 1 ? 'copy has' : 'copies have'}` : ''}: ${plural(k.afterIfKept, 'song')}. Delete ${deleted} (saved first).`
+}
+/** Bar widths: songs the kept copy has, and songs merged in from the others. */
+const bar = (g: DuplicateGroupView) => ({ kept: kept(g).items / g.union * 100, added: (kept(g).afterIfKept - kept(g).items) / g.union * 100 })
 </script>
 
 <template>
@@ -155,13 +184,13 @@ const later = computed(() => [
       </ul>
     </section>
 
-    <section class="card section">
+    <section v-for="t in sections" :key="t.tier" class="card section">
       <div class="section-head">
-        <h2 class="section-title"><span class="badge b-mint" aria-hidden="true">=</span>Exact copies on <ServiceIcon provider="tidal" :size="18" />Tidal</h2>
-        <span class="mono fine">{{ plural(exact.length, 'group') }} · at least 90% of the tracks shared</span>
+        <h2 class="section-title"><span class="badge" :class="t.cls" aria-hidden="true">{{ t.glyph }}</span>{{ t.title }}</h2>
+        <span class="mono fine">{{ plural(t.groups.length, 'group') }}</span>
       </div>
-      <p class="muted note">Pick the Tidal copy to keep. It gets every track from every copy, then the other Tidal copies are deleted. Spotify playlists are shown for comparison and are not changed.</p>
-      <p v-if="!exact.length" class="muted">None.</p>
+      <p class="muted note">{{ t.note }} Pick the Tidal copy to keep; Spotify is shown for comparison and not changed.</p>
+      <p v-if="!t.groups.length" class="muted">None.</p>
       <div v-else class="table-head group" aria-hidden="true">
         <span />
         <span class="label">Playlist</span>
@@ -170,16 +199,19 @@ const later = computed(() => [
         <span class="label end">Tidal after</span>
       </div>
       <ul class="list">
-        <li v-for="g in exact" :key="g.key" class="row group" :class="{ off: !merge[g.key] }">
+        <li v-for="g in t.groups" :key="g.key" class="row group" :class="{ off: !merge[g.key] }">
           <label class="check">
             <input v-model="merge[g.key]" type="checkbox" :disabled="!g.actionable || running" :aria-label="`Merge the Tidal copies of ${g.name}`">
           </label>
-          <div class="row-name">{{ g.name }}</div>
+          <div class="row-name">
+            {{ g.name }}
+            <div class="mono fine overlap">{{ g.shared }} in every copy · {{ g.union }} altogether</div>
+          </div>
           <div class="cell">
             <span class="cell-service"><ServiceIcon provider="spotify" :size="12" />Spotify</span>
             <template v-if="g.counterpart.length">
               <div v-for="o in g.counterpart" :key="o.id" class="side">
-                <span class="mono">{{ plural(o.items, 'track') }}</span>
+                <span class="mono">{{ plural(o.items, 'song') }}</span>
                 <span class="mono fine">not changed</span>
                 <a :href="o.url" target="_blank" rel="noopener" class="mono fine open">open ↗</a>
               </div>
@@ -192,16 +224,21 @@ const later = computed(() => [
               <label v-for="c in g.copies" :key="c.id" class="copy" :class="{ keep: keeper[g.key] === c.id }">
                 <input v-model="keeper[g.key]" type="radio" :name="g.key" :value="c.id" :disabled="!g.actionable || running">
                 <span class="copy-glyph" aria-hidden="true">{{ keeper[g.key] === c.id ? '●' : '−' }}</span>
-                <span class="copy-role mono">{{ keeper[g.key] === c.id ? 'keep on Tidal' : 'delete from Tidal' }}</span>
-                <span class="mono">{{ plural(c.items, 'track') }}</span>
-                <span v-if="c.unique" class="mono fine">{{ c.unique }} only here</span>
+                <span class="copy-role mono">{{ keeper[g.key] === c.id ? 'keep' : 'delete' }}</span>
+                <span class="mono">{{ plural(c.items, 'song') }}</span>
+                <span class="mono fine">{{ c.unique ? `${c.unique} only in this copy` : 'nothing only here' }}</span>
                 <a :href="c.url" target="_blank" rel="noopener" class="mono fine open">open ↗</a>
               </label>
             </div>
+            <div class="bar" role="img" :aria-label="outcome(g)">
+              <span class="bar-kept" :style="{ width: `${bar(g).kept}%` }" />
+              <span class="bar-added" :style="{ width: `${bar(g).added}%` }" />
+            </div>
+            <p class="outcome">{{ outcome(g) }}</p>
           </div>
           <div class="after">
             <span class="cell-service"><ServiceIcon provider="tidal" :size="12" />Tidal after</span>
-            <span class="mono">{{ plural(kept(g).afterIfKept, 'track') }}</span>
+            <span class="mono">{{ plural(kept(g).afterIfKept, 'song') }}</span>
           </div>
         </li>
       </ul>
@@ -268,23 +305,6 @@ const later = computed(() => [
       </ul>
     </section>
 
-    <section v-for="t in later" :key="t.tier" class="card section later">
-      <div class="section-head">
-        <h2 class="section-title"><span class="badge" :class="t.cls" aria-hidden="true">{{ t.glyph }}</span>{{ t.title }}</h2>
-        <span class="mono fine">{{ plural(t.groups.length, 'group') }} · shown only</span>
-      </div>
-      <p class="muted note">{{ t.note }}</p>
-      <ul class="list">
-        <li v-for="g in t.groups" :key="g.key" class="row later-row">
-          <span class="row-name">{{ g.name }}</span>
-          <span class="mono fine service-label"><ServiceIcon :provider="g.provider" :size="12" />{{ providerName[g.provider] }}</span>
-          <span class="mono fine">
-            <template v-for="(c, i) in g.copies" :key="c.id"><template v-if="i"> / </template><a :href="c.url" target="_blank" rel="noopener">{{ c.items }}</a></template>
-            tracks · {{ g.shared }} shared · {{ g.union }} combined
-          </span>
-        </li>
-      </ul>
-    </section>
   </main>
 </template>
 
@@ -338,8 +358,12 @@ const later = computed(() => [
 .after { display: grid; justify-items: end; gap: 4px; padding-top: 4px; font-size: 13px; }
 
 .empty-row { grid-template-columns: 28px minmax(0, 0.9fr) minmax(0, 0.9fr) minmax(0, 1.6fr); align-items: start; }
-.later-row { grid-template-columns: minmax(0, 1fr) auto auto; }
-.later-row a { color: inherit; }
+/* What a merge leaves on Tidal: the kept copy's songs, then the ones merged in from the others. */
+.bar { display: flex; height: 6px; margin-top: 8px; border-radius: 999px; background: var(--hairline); overflow: hidden; }
+.bar-kept { background: var(--mint); }
+.bar-added { background: var(--amber); }
+.outcome { margin: 6px 0 0; font-size: 13px; color: var(--text-muted); }
+.overlap { margin-top: 4px; font-weight: 400; }
 .pulled-row { grid-template-columns: minmax(0, 1.4fr) auto minmax(0, 1fr); }
 .min { min-width: 0; }
 .small { font-size: 13px; margin-top: 2px; }
@@ -360,7 +384,7 @@ const later = computed(() => [
   .group, .empty-row { grid-template-columns: 28px minmax(0, 1fr); }
   .group > :nth-child(n + 3), .empty-row > :nth-child(n + 3) { grid-column: 2; }
   .after { justify-items: start; }
-  .later-row, .pulled-row { grid-template-columns: 1fr; }
+  .pulled-row { grid-template-columns: 1fr; }
   .outcome { grid-template-columns: 30px minmax(0, 1fr); }
   .outcome > :nth-child(n + 3) { grid-column: 2; }
 }
