@@ -1,6 +1,9 @@
 <script setup lang="ts">
 // Service marks, inlined so they need no extra requests. Spotify: the 48 px icon from open.spotify.com's
-// favicon. Tidal: the diamond mark from Tidal's developer docs, drawn in currentColor (white on black).
+// favicon, a green circle with the black mark inside. Tidal: the diamond mark from Tidal's developer docs in white,
+// about 60% of the diameter wide, inside a black circle (Tidal's brand colour) with a faint light ring so it reads
+// on the black page. The viewBox is in the mark's own units: 400 across, centred on the mark (239.5 x 159.7).
+// The ring is 1 px at any size, inset by half a pixel so it isn't clipped.
 import type { ProviderId } from '~~/shared/types'
 
 withDefaults(defineProps<{ provider: ProviderId, size?: number, dim?: boolean }>(), { size: 16, dim: false })
@@ -10,12 +13,13 @@ const SPOTIFY = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXA
 
 <template>
   <img v-if="provider === 'spotify'" :src="SPOTIFY" :width="size" :height="size" alt="Spotify" class="icon" :class="{ dim }">
-  <svg v-else :width="size" :height="size * 0.667" viewBox="0 0 239.5 159.7" role="img" aria-label="Tidal" class="icon" :class="{ dim }">
-    <path fill="currentColor" d="M159.67 39.938l-39.88 39.88-39.88-39.88 39.88-39.88zM159.669 119.756l-39.88 39.88-39.88-39.88 39.88-39.88zM79.809 39.912l-39.88 39.88-39.88-39.88 39.88-39.88zM239.505 39.93l-39.88 39.88-39.88-39.88 39.88-39.88z" />
+  <svg v-else :width="size" :height="size" viewBox="-80.25 -120.15 400 400" role="img" aria-label="Tidal" class="icon" :class="{ dim }">
+    <circle cx="119.75" cy="79.85" :r="200 - 200 / size" fill="#000" stroke="rgba(255, 255, 255, 0.25)" stroke-width="1" vector-effect="non-scaling-stroke" />
+    <path fill="#fff" d="M159.67 39.938l-39.88 39.88-39.88-39.88 39.88-39.88zM159.669 119.756l-39.88 39.88-39.88-39.88 39.88-39.88zM79.809 39.912l-39.88 39.88-39.88-39.88 39.88-39.88zM239.505 39.93l-39.88 39.88-39.88-39.88 39.88-39.88z" />
   </svg>
 </template>
 
 <style scoped>
-.icon { display: inline-block; flex: none; vertical-align: middle; color: var(--tidal); }
+.icon { display: inline-block; flex: none; vertical-align: middle; }
 .dim { opacity: 0.3; filter: grayscale(1); }
 </style>
