@@ -3,6 +3,7 @@ import { and, desc, eq, inArray, isNull } from 'drizzle-orm'
 import type { CollectionStatusView, LibraryView, ProviderId, RunStatus, StatusCounts, StatusRowView } from '../../shared/types'
 import { PROVIDERS } from '../../shared/types'
 import type { MainEntry } from '../core/pull'
+import { normaliseText } from '../core/normalise'
 import { rowState, status, type StatusInput } from '../core/status'
 import { schema, useDb } from './db'
 
@@ -24,10 +25,13 @@ export function libraryView(selectedKey?: string): LibraryView {
   const totals = { ...emptyCounts(), held: openHolds.length }
   for (const c of collections) {
     const main = new Map<number, MainEntry>(memberships.filter(m => m.collectionId === c.id).map(m => [m.canonicalTrackId, { state: m.state, changedAt: m.changedAt, changedBy: m.changedBy }]))
-    if (!main.size && !openHolds.some(h => h.collectionId === c.id)) continue
+    const own = links.filter(l => l.collectionId === c.id)
+    const followedOn = (p: ProviderId) => own.some(l => l.provider === p && l.access === 'followed')
+    // A followed playlist with no copy anywhere readable has no songs in main, but is still listed.
+    if (!main.size && !openHolds.some(h => h.collectionId === c.id) && !PROVIDERS.some(followedOn)) continue
     const sides = Object.fromEntries(PROVIDERS.map((p) => {
       const snap = snapshots.find(s => s.provider === p && s.collectionId === c.id)
-      return [p, { pulled: pulled[p], items: snap ? new Map(snap.items.map(i => [i.canonicalTrackId, i.available])) : null }]
+      return [p, { pulled: pulled[p], items: snap ? new Map(snap.items.map(i => [i.canonicalTrackId, i.available])) : null, followed: followedOn(p) }]
     })) as StatusInput['sides']
     const input: StatusInput = {
       main,
@@ -47,10 +51,17 @@ export function libraryView(selectedKey?: string): LibraryView {
       key: String(c.id),
       kind: c.kind,
       name: c.name,
-      on: Object.fromEntries(PROVIDERS.map(p => [p, links.some(l => l.collectionId === c.id && l.provider === p)])) as Record<ProviderId, boolean>,
+      on: Object.fromEntries(PROVIDERS.map(p => [p, own.some(l => l.provider === p && l.access !== 'followed')])) as Record<ProviderId, boolean>,
+      shared: Object.fromEntries(own.filter(l => l.access !== 'owned').map(l => [l.provider, { access: l.access as 'collaborative' | 'followed', ownerName: l.ownerName }])),
       counts,
+      songs: [...main.values()].filter(m => m.state === 'active').length,
+      namesakes: [],
       holds: openHolds.filter(h => h.collectionId === c.id).map(h => ({ id: h.id, provider: h.provider, reason: h.reason, before: h.before, removing: h.removing, detectedAt: h.detectedAt, runId: h.runId })),
     })
+  }
+  const byName = Map.groupBy(views.filter(v => v.kind === 'playlist'), v => normaliseText(v.name))
+  for (const v of views) {
+    v.namesakes = (byName.get(normaliseText(v.name)) ?? []).filter(o => o !== v).map(o => ({ key: o.key, on: o.on, songs: o.songs }))
   }
   views.sort((a, b) => Number(b.kind === 'liked') - Number(a.kind === 'liked') || a.name.localeCompare(b.name))
 

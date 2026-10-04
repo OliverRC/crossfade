@@ -14,9 +14,19 @@ export interface ProviderTrack {
   available?: boolean
 }
 
+/**
+ * owned: yours. collaborative: someone else's that you can edit; read, linked and pushed like your own.
+ * followed: someone else's that you only follow. Spotify does not let apps read its songs (403), so it is listed, never read or pushed.
+ */
+export type PlaylistAccess = 'owned' | 'collaborative' | 'followed'
+
 export interface ProviderPlaylist {
   providerCollectionId: string
   name: string
+  /** Absent means owned (lists saved before followed playlists were kept). */
+  access?: PlaylistAccess
+  /** The owner's display name, for playlists that are not yours. */
+  ownerName?: string | null
 }
 
 export type LinkStatus = 'matched' | 'review' | 'unmatched' | 'ignored'
@@ -67,8 +77,14 @@ export interface CollectionStatusView {
   key: string
   kind: 'liked' | 'playlist'
   name: string
-  /** The collection exists on the service. */
+  /** The collection exists on the service and Crossfade can read it. */
   on: Record<ProviderId, boolean>
+  /** Someone else's playlist on the service: collaborative ones are read and pushed; followed ones cannot be read. */
+  shared: Partial<Record<ProviderId, { access: 'collaborative' | 'followed', ownerName: string | null }>>
+  /** Songs in main's copy of this collection. */
+  songs: number
+  /** Other collections in main with the same name: usually a second copy on one service. */
+  namesakes: { key: string, on: Record<ProviderId, boolean>, songs: number }[]
   counts: StatusCounts
   holds: HoldView[]
 }
@@ -117,7 +133,7 @@ export type StageKey = 'fetch:spotify' | 'fetch:tidal' | 'link' | 'pair' | 'matc
 export interface StageInfo { key: StageKey, label: string, help: string }
 
 const STAGE_INFO: Record<StageKey, Omit<StageInfo, 'key'>> = {
-  'fetch:spotify': { label: 'Fetch Spotify', help: 'Liked songs and every playlist you own, saved as each one arrives.' },
+  'fetch:spotify': { label: 'Fetch Spotify', help: 'Liked songs and every playlist you own or collaborate on, saved as each one arrives. Playlists you only follow are listed but not read: Spotify does not let apps read them.' },
   'fetch:tidal': { label: 'Fetch Tidal', help: 'Liked songs and every playlist you own, saved as each one arrives. Songs Tidal lists but will not play in your country are kept, marked unavailable.' },
   'link': { label: 'Link tracks', help: 'Every track becomes one canonical record; equal ISRCs on both services share one.' },
   'pair': { label: 'Pair playlists', help: 'Liked songs with liked songs; playlists by a previous pairing or by name.' },
@@ -319,6 +335,7 @@ export type HoldReason = 'empty' | 'mass_removal' | 'gone'
  * A song's state on one service compared with main (docs/decisions/0005).
  * present: there and in main. missing: in main, not there (a push adds it). extra: removed from main, still there
  * (a push removes it). unavailable: listed but no longer offered. absent: removed from main and not there.
- * unknown: the service has not been pulled yet.
+ * unknown: the service has not been pulled yet. followed: the service has it as someone else's playlist you only
+ * follow, which it does not let apps read; never pushed.
  */
-export type SideState = 'present' | 'missing' | 'extra' | 'unavailable' | 'absent' | 'unknown'
+export type SideState = 'present' | 'missing' | 'extra' | 'unavailable' | 'absent' | 'unknown' | 'followed'

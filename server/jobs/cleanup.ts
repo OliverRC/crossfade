@@ -42,7 +42,8 @@ function loadFetched(provider: ProviderId): Fetched | null {
   const runs = db.select({ id: schema.syncRuns.id, kind: schema.syncRuns.kind, provider: schema.syncRuns.provider, playlists: schema.syncRuns.playlists }).from(schema.syncRuns)
     .orderBy(desc(schema.syncRuns.id)).all().filter(r => r.kind === 'sync' || (r.kind === 'pull' && r.provider === provider))
   for (const run of runs) {
-    const listed = run.playlists?.[provider]
+    // Followed playlists are listed but never read, so they have no saved fetch.
+    const listed = run.playlists?.[provider]?.filter(p => p.access !== 'followed')
     if (!listed) continue
     const saved = db.select().from(schema.fetchCheckpoints).where(eq(schema.fetchCheckpoints.runId, run.id)).all()
       .filter(c => c.provider === provider && c.kind === 'playlist')

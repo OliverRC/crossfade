@@ -2,7 +2,7 @@
 // memberships; each service has a snapshot per collection, the last state a pull read from it.
 import { sql } from 'drizzle-orm'
 import { index, integer, real, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core'
-import type { HoldReason, RunKind, SnapshotItem, LinkMethod, LinkStatus, ProviderId, ProviderPlaylist, ProviderTrack, RunPause, RunStages, StageKey, UnmatchedReason } from '../../shared/types'
+import type { HoldReason, RunKind, SnapshotItem, LinkMethod, LinkStatus, PlaylistAccess, ProviderId, ProviderPlaylist, ProviderTrack, RunPause, RunStages, StageKey, UnmatchedReason } from '../../shared/types'
 
 const createdAt = () => text('created_at').notNull().default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`)
 
@@ -49,7 +49,10 @@ export const collectionLinks = sqliteTable('collection_links', {
   provider: text('provider').$type<ProviderId>().notNull(),
   /** Null for liked songs. */
   providerCollectionId: text('provider_collection_id'),
-  isOwned: integer('is_owned', { mode: 'boolean' }).notNull().default(true),
+  /** followed: someone else's playlist the service will not let us read; listed only, never read or pushed. */
+  access: text('access').$type<PlaylistAccess>().notNull().default('owned'),
+  /** The owner's display name when the playlist is not yours. */
+  ownerName: text('owner_name'),
 }, t => [uniqueIndex('collection_links_provider_collection').on(t.provider, t.providerCollectionId)])
 
 export const providerAccounts = sqliteTable('provider_accounts', {

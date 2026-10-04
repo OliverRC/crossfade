@@ -8,6 +8,8 @@ export interface StatusSide {
   pulled: boolean
   /** Songs in this collection on the service at its last pull, mapped to whether it still offers them. Null when the collection is not on the service. */
   items: Map<number, boolean> | null
+  /** The service has this collection as someone else's playlist it will not let us read: nothing to compare or push. */
+  followed?: boolean
 }
 
 export interface StatusInput {
@@ -27,6 +29,7 @@ export interface StatusRow {
 
 function sideState(entry: MainEntry, side: StatusSide, id: number): SideState {
   if (!side.pulled) return 'unknown'
+  if (side.followed) return 'followed'
   const available = side.items?.get(id)
   if (entry.state === 'active') {
     if (available === undefined) return 'missing'
@@ -35,7 +38,7 @@ function sideState(entry: MainEntry, side: StatusSide, id: number): SideState {
   return available === undefined ? 'absent' : 'extra'
 }
 
-const RANK: Record<SideState, number> = { missing: 1, extra: 1, unavailable: 2, unknown: 3, present: 4, absent: 4 }
+const RANK: Record<SideState, number> = { missing: 1, extra: 1, unavailable: 2, unknown: 3, present: 4, absent: 4, followed: 4 }
 
 export function status(input: StatusInput): { rows: StatusRow[], counts: StatusCounts } {
   const zero = () => ({ spotify: 0, tidal: 0 })
@@ -60,7 +63,7 @@ export function status(input: StatusInput): { rows: StatusRow[], counts: StatusC
       if (row[p] === 'extra') counts.remove[p]++
       if (row[p] === 'unavailable') counts.unavailable[p]++
     }
-    if (PROVIDERS.every(p => row[p] === 'present')) counts.inSync++
+    if (PROVIDERS.every(p => row[p] === 'present' || row[p] === 'followed')) counts.inSync++
   }
 
   const rank = (r: StatusRow) => (r.conflict ? 0 : Math.min(RANK[r.spotify], RANK[r.tidal]))
@@ -71,7 +74,8 @@ export function status(input: StatusInput): { rows: StatusRow[], counts: StatusC
 /** One state per row for the Library page: a conflict first, then pending removals, adds, unavailable, unknown. */
 export function rowState(row: StatusRow): RowState {
   if (row.conflict) return 'conflict'
-  const sides = PROVIDERS.map(p => row[p])
+  // A followed side cannot be compared, so the row's state comes from the services that can.
+  const sides = PROVIDERS.map(p => row[p]).filter(s => s !== 'followed')
   if (sides.includes('extra')) return 'remove'
   if (sides.includes('missing')) return 'add'
   if (sides.includes('unavailable')) return 'unavailable'

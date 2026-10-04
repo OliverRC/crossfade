@@ -4,8 +4,8 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { eq } from 'drizzle-orm'
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest'
-import type { LibraryView, ProviderId, ProviderTrack } from '../shared/types'
-import { QuotaError } from '../server/providers/http'
+import type { LibraryView, PlaylistAccess, ProviderId, ProviderTrack } from '../shared/types'
+import { ProviderError, QuotaError } from '../server/providers/http'
 import type { MusicProvider } from '../server/providers/types'
 
 type Db = typeof import('../server/utils/db')
@@ -23,7 +23,8 @@ const S = (n: number) => t(`s${n}`, `ISRC${n}`)
 const T = (n: number) => t(`t${n}`, `ISRC${n}`)
 const range = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, i) => from + i)
 
-interface Library { liked: ProviderTrack[], playlists: Record<string, { name: string, tracks: ProviderTrack[] }> }
+interface FakePlaylist { name: string, tracks: ProviderTrack[], access?: PlaylistAccess, /** Collaborative, but the service answers 403. */ refuses?: boolean }
+interface Library { liked: ProviderTrack[], playlists: Record<string, FakePlaylist> }
 const libraries: Record<ProviderId, Library> = { spotify: { liked: [], playlists: {} }, tidal: { liked: [], playlists: {} } }
 let quotaOn: string | null = null
 
@@ -34,8 +35,13 @@ function fake(id: ProviderId): MusicProvider {
     id,
     isrcBatchSize: 20,
     getLikedTracks: async () => { guard('liked'); return lib().liked },
-    getOwnedPlaylists: async () => Object.entries(lib().playlists).map(([providerCollectionId, p]) => ({ providerCollectionId, name: p.name })),
-    getPlaylistTracks: async (pid) => { guard(pid); return lib().playlists[pid]!.tracks },
+    getPlaylists: async () => Object.entries(lib().playlists).map(([providerCollectionId, p]) => ({ providerCollectionId, name: p.name, access: p.access ?? 'owned', ownerName: p.access ? 'Niki' : null })),
+    getPlaylistTracks: async (pid) => {
+      guard(pid)
+      const p = lib().playlists[pid]!
+      if (p.access === 'followed' || p.refuses) throw new ProviderError(id, 403, `${id} GET /playlists/${pid}/items → 403`)
+      return p.tracks
+    },
     findByIsrcs: async () => { throw new Error('a pull never looks songs up') },
     search: async () => { throw new Error('a pull never searches') },
   }
@@ -93,6 +99,49 @@ describe('pull into main', () => {
     expect(collection(libraryView(), 'Gym').on).toEqual({ spotify: false, tidal: true })
     expect(states('Gym')).toEqual({ ISRC5: 'missing/present' })
     expect(libraryView().totals.add).toEqual({ spotify: 2, tidal: 2 })
+  })
+
+  it('reads a collaborative playlist like your own and pairs it by name', async () => {
+    libraries.spotify.playlists.sp2 = { name: 'Gym', tracks: [S(5), S(6)], access: 'collaborative' }
+    await pullOf('tidal')
+    await pullOf('spotify')
+    const gym = collection(libraryView(), 'Gym')
+    expect(gym.on).toEqual({ spotify: true, tidal: true })
+    expect(gym.shared).toEqual({ spotify: { access: 'collaborative', ownerName: 'Niki' } })
+    expect(states('Gym')).toEqual({ ISRC6: 'present/missing' })
+  })
+
+  it('lists a followed playlist without reading it: nothing to push, and no songs counted missing', async () => {
+    libraries.spotify.playlists.sp2 = { name: 'Gym', tracks: [S(9)], access: 'followed' }
+    libraries.spotify.playlists.sp3 = { name: 'Bali', tracks: [S(8)], access: 'followed' }
+    await pullOf('tidal')
+    const outcome = await pullOf('spotify')
+    expect(outcome.counts.held).toBe(0)
+    const gym = collection(libraryView(), 'Gym')
+    expect(gym.on).toEqual({ spotify: false, tidal: true })
+    expect(gym.shared).toEqual({ spotify: { access: 'followed', ownerName: 'Niki' } })
+    expect(gym.counts.add.spotify).toBe(0)
+    expect(rowsOf('Gym')).toMatchObject([{ state: 'in_sync', spotify: 'followed', tidal: 'present' }])
+    // Followed only on Spotify, with no copy anywhere readable: listed, with no songs.
+    expect(collection(libraryView(), 'Bali').shared.spotify?.access).toBe('followed')
+    expect(rowsOf('Bali')).toEqual([])
+    expect(db.select().from(schema.canonicalTracks).all().some(t => t.isrc === 'ISRC8' || t.isrc === 'ISRC9')).toBe(false)
+
+    // Unfollowed: the empty listing goes; the Tidal copy stays, back to Tidal only.
+    delete libraries.spotify.playlists.sp2
+    delete libraries.spotify.playlists.sp3
+    expect((await pullOf('spotify')).counts.held).toBe(0)
+    expect(libraryView().collections.some(c => c.name === 'Bali')).toBe(false)
+    expect(collection(libraryView(), 'Gym').shared).toEqual({})
+  })
+
+  it('treats a collaborative playlist the service refuses to read as followed', async () => {
+    libraries.spotify.playlists.sp2 = { name: 'Gym', tracks: [S(5)], access: 'collaborative', refuses: true }
+    await pullOf('tidal')
+    const outcome = await pullOf('spotify')
+    expect(outcome.pause).toBeNull()
+    expect(collection(libraryView(), 'Gym').shared.spotify?.access).toBe('followed')
+    expect(rowsOf('Gym')).toMatchObject([{ spotify: 'followed' }])
   })
 
   it('pulling again with nothing changed reports nothing new', async () => {

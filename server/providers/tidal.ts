@@ -96,9 +96,9 @@ export function createTidal(country: string): MusicProvider {
 
     getLikedTracks: () => readTracks('/userCollectionTracks/me/relationships/items'),
 
-    async getOwnedPlaylists() {
+    async getPlaylists() {
       const { data } = await pages('/playlists', { 'filter[owners.id]': 'me', countryCode: country })
-      return data.map((p): ProviderPlaylist => ({ providerCollectionId: String(p.id), name: p.attributes?.name ?? '' }))
+      return data.map((p): ProviderPlaylist => ({ providerCollectionId: String(p.id), name: p.attributes?.name ?? '', access: 'owned' }))
     },
 
     getPlaylistTracks: playlistId => readTracks(`/playlists/${playlistId}/relationships/items`),

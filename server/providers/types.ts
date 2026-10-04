@@ -12,7 +12,8 @@ export interface MusicProvider {
   readonly isrcBatchSize: number
   /** Liked and playlist reads include songs the service still lists but no longer offers, with `available: false`. */
   getLikedTracks(): Promise<ProviderTrack[]>
-  getOwnedPlaylists(): Promise<ProviderPlaylist[]>
+  /** Playlists you own or collaborate on, plus (Spotify) ones you only follow, marked `followed` and never read. */
+  getPlaylists(): Promise<ProviderPlaylist[]>
   getPlaylistTracks(playlistId: string): Promise<ProviderTrack[]>
   /** Each ISRC maps to every track found for it; `requests` is what the lookup cost. */
   findByIsrcs(isrcs: string[]): Promise<IsrcLookup>

@@ -46,11 +46,13 @@ export function createSpotify(userId: string): MusicProvider {
       return tracksOf(await pages('/me/tracks?limit=50'))
     },
 
-    async getOwnedPlaylists() {
+    async getPlaylists() {
+      // Spotify only returns the songs of playlists you own or collaborate on; the rest are listed as followed.
       const playlists = await pages<any>('/me/playlists?limit=50')
-      return playlists
-        .filter(p => p?.owner?.id === userId)
-        .map((p): ProviderPlaylist => ({ providerCollectionId: p.id, name: p.name }))
+      return playlists.filter(p => p?.id).map((p): ProviderPlaylist => {
+        if (p.owner?.id === userId) return { providerCollectionId: p.id, name: p.name, access: 'owned' }
+        return { providerCollectionId: p.id, name: p.name, access: p.collaborative ? 'collaborative' : 'followed', ownerName: p.owner?.display_name ?? p.owner?.id ?? null }
+      })
     },
 
     async getPlaylistTracks(playlistId) {

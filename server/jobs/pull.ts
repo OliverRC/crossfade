@@ -2,11 +2,11 @@
 // playlists, link every track to a canonical record, pair playlists with main's collections, then merge each
 // collection's changes since the service's last snapshot into main. Reads from the service only; never writes to it.
 import { and, eq, isNull } from 'drizzle-orm'
-import type { HoldReason, ProviderId, ProviderTrack, RunPause, SnapshotItem, StageKey } from '../../shared/types'
+import type { HoldReason, ProviderId, ProviderPlaylist, ProviderTrack, RunPause, SnapshotItem, StageKey } from '../../shared/types'
 import { normaliseText } from '../core/normalise'
 import { pull, type MainEntry } from '../core/pull'
 import { getProvider } from '../providers'
-import { QuotaError, requestCounts } from '../providers/http'
+import { ProviderError, QuotaError, requestCounts } from '../providers/http'
 import type { MusicProvider } from '../providers/types'
 import { schema, useDb } from '../utils/db'
 import { quotaBlockedUntil, quotaPause, providerNames } from './quota'
@@ -69,11 +69,20 @@ export async function runPull(
   try {
     if (!playlists[provider]) {
       report('fetch', `Listing ${name} playlists`)
-      playlists[provider] = await service.getOwnedPlaylists()
+      playlists[provider] = await service.getPlaylists()
       db.update(schema.syncRuns).set({ playlists }).where(eq(schema.syncRuns.id, runId)).run()
-      log.event('info', fetchKey, `Found ${count(playlists[provider]!.length, 'playlist')} you own on ${name}`)
+      const listed = playlists[provider]!
+      const shared = listed.filter(pl => pl.access === 'collaborative').length
+      const followed = listed.filter(pl => pl.access === 'followed').length
+      log.event('info', fetchKey, `Found ${count(listed.length - shared - followed, 'playlist')} you own on ${name}`
+        + (shared ? `, ${shared} you collaborate on` : '')
+        + (followed ? `, and ${followed} you only follow (${name} does not let apps read those, so they are listed but not read)` : ''))
     }
-    const todo = [{ kind: 'liked' as const, key: 'liked', name: 'Liked songs' }, ...playlists[provider]!.map(pl => ({ kind: 'playlist' as const, key: pl.providerCollectionId, name: pl.name }))]
+    const readable = playlists[provider]!.filter(pl => pl.access !== 'followed')
+    const todo = [
+      { kind: 'liked' as const, key: 'liked', name: 'Liked songs', access: 'owned' as const },
+      ...readable.map(pl => ({ kind: 'playlist' as const, key: pl.providerCollectionId, name: pl.name, access: pl.access ?? 'owned' })),
+    ]
     const fromCheckpoints = todo.filter(c => done.has(c.key)).length
     if (fromCheckpoints) log.event('info', fetchKey, `${count(fromCheckpoints, 'collection')} already fetched by an earlier attempt; skipping ${fromCheckpoints === 1 ? 'it' : 'them'}`)
     let fetchedNow = fromCheckpoints
@@ -83,7 +92,18 @@ export async function runPull(
       const label = c.kind === 'liked' ? 'liked songs' : `"${c.name}"`
       report('fetch', `Reading ${name} ${label}`, i + 1, todo.length)
       log.stage(fetchKey, { detail: `Reading ${label}` })
-      const tracks = c.kind === 'liked' ? await service.getLikedTracks() : await service.getPlaylistTracks(c.key)
+      let tracks: ProviderTrack[]
+      try {
+        tracks = c.kind === 'liked' ? await service.getLikedTracks() : await service.getPlaylistTracks(c.key)
+      } catch (error) {
+        if (!(c.access === 'collaborative' && error instanceof ProviderError && error.status === 403)) throw error
+        // Listed as collaborative, but the service will not show us its songs: treat it as followed.
+        playlists[provider] = playlists[provider]!.map(pl => (pl.providerCollectionId === c.key ? { ...pl, access: 'followed' as const } : pl))
+        db.update(schema.syncRuns).set({ playlists }).where(eq(schema.syncRuns.id, runId)).run()
+        log.event('warn', fetchKey, `"${c.name}" is collaborative, but ${name} refused to return its songs; listed as followed instead`)
+        log.stage(fetchKey, { done: ++fetchedNow })
+        continue
+      }
       db.insert(schema.fetchCheckpoints).values({ runId, provider, kind: c.kind, collectionKey: c.key, name: c.name, tracks, fetchedAt: now() }).run()
       done.add(c.key)
       log.stage(fetchKey, { done: ++fetchedNow })
@@ -112,8 +132,10 @@ export async function runPull(
   // 3. Pair collections: liked with liked, playlists by stored link or normalised name. Idempotent.
   log.stage('pair', { status: 'running', detail: null })
   report('pair', 'Pairing playlists')
-  const collectionFor = pairCollections(fetched)
-  log.stage('pair', { status: 'done', detail: count(fetched.length, 'collection') })
+  const listed = playlists[provider]!
+  const collectionFor = pairCollections(fetched, listed)
+  const followedCount = listed.filter(pl => pl.access === 'followed').length
+  log.stage('pair', { status: 'done', detail: `${count(fetched.length, 'collection')}${followedCount ? `, ${followedCount} followed listed` : ''}` })
 
   // 4. Merge each collection into main, and flag playlists that are no longer on the service.
   log.stage('merge', { status: 'running', done: 0, total: fetched.length, detail: null })
@@ -133,7 +155,7 @@ export async function runPull(
     }
     log.stage('merge', { done: i + 1 })
   }
-  counts.held += flagGonePlaylists(provider, fetched, runId, log)
+  counts.held += flagGonePlaylists(provider, listed, runId, log)
   log.stage('merge', {
     status: 'done',
     detail: `${counts.added} added, ${counts.removed} removed, ${count(counts.conflicts, 'conflict')}${counts.held ? `, ${counts.held} held` : ''}`,
@@ -242,9 +264,9 @@ export function mergeCollection(input: MergeInput): MergeResult {
 }
 
 /** A playlist the service had at its last pull but no longer lists: held, never treated as every song removed. */
-function flagGonePlaylists(provider: ProviderId, fetched: FetchedCollection[], runId: number, log: RunLog): number {
+function flagGonePlaylists(provider: ProviderId, playlists: ProviderPlaylist[], runId: number, log: RunLog): number {
   const db = useDb()
-  const listed = new Set(fetched.map(c => c.providerCollectionId).filter(Boolean))
+  const listed = new Set(playlists.map(pl => pl.providerCollectionId))
   const gone = db.select().from(schema.snapshots).where(eq(schema.snapshots.provider, provider)).all()
     .filter(s => s.providerCollectionId && !listed.has(s.providerCollectionId))
   for (const s of gone) {
@@ -309,22 +331,57 @@ function linkTracks(fetched: FetchedCollection[]): { ids: Map<string, number>, c
   return { ids, created, merged }
 }
 
-/** Pair each fetched collection with a collection in main: liked with liked, playlists by stored link or name. */
-function pairCollections(fetched: FetchedCollection[]): Map<FetchedCollection, number> {
+/**
+ * Pair each fetched collection with a collection in main: liked with liked, playlists by stored link or name.
+ * Playlists the service lists but will not let us read (followed) are paired the same way, after the readable ones,
+ * so main knows the service has them; they get no snapshot and are never pushed. Idempotent.
+ */
+function pairCollections(fetched: FetchedCollection[], listed: ProviderPlaylist[]): Map<FetchedCollection, number> {
   const db = useDb()
   const out = new Map<FetchedCollection, number>()
+  const provider = fetched[0]?.provider
+  if (!provider) return out
   const existing = db.select({ link: schema.collectionLinks, collection: schema.collections }).from(schema.collectionLinks)
     .innerJoin(schema.collections, eq(schema.collections.id, schema.collectionLinks.collectionId)).all()
+  const info = new Map(listed.map(pl => [pl.providerCollectionId, { access: pl.access ?? 'owned', ownerName: pl.ownerName ?? null }]))
 
   const likedId = existing.find(e => e.collection.kind === 'liked')?.collection.id
     ?? db.select({ id: schema.collections.id }).from(schema.collections).where(eq(schema.collections.kind, 'liked')).get()?.id
     ?? db.insert(schema.collections).values({ kind: 'liked', name: 'Liked songs' }).returning().get().id
 
-  const byName = new Map<string, { id: number, providers: Set<ProviderId> }>()
+  // Several collections can share a name (copies on one service); pair with the first this service is not on yet.
+  const byName = new Map<string, { id: number, providers: Set<ProviderId> }[]>()
+  const entries = new Map<number, { id: number, providers: Set<ProviderId> }>()
   for (const e of existing.filter(e => e.collection.kind === 'playlist')) {
-    const entry = byName.get(normaliseText(e.collection.name)) ?? { id: e.collection.id, providers: new Set() }
+    let entry = entries.get(e.collection.id)
+    if (!entry) {
+      entry = { id: e.collection.id, providers: new Set() }
+      entries.set(e.collection.id, entry)
+      const key = normaliseText(e.collection.name)
+      byName.set(key, [...byName.get(key) ?? [], entry])
+    }
     entry.providers.add(e.link.provider)
-    byName.set(normaliseText(e.collection.name), entry)
+  }
+
+  /** The collection a playlist belongs to, linking it on first sight and keeping its access current. */
+  const pair = (providerCollectionId: string, name: string): number => {
+    const { access, ownerName } = info.get(providerCollectionId) ?? { access: 'owned' as const, ownerName: null }
+    const linked = existing.find(e => e.link.provider === provider && e.link.providerCollectionId === providerCollectionId)
+    if (linked) {
+      if (linked.link.access !== access || linked.link.ownerName !== ownerName) {
+        db.update(schema.collectionLinks).set({ access, ownerName }).where(eq(schema.collectionLinks.id, linked.link.id)).run()
+      }
+      return linked.collection.id
+    }
+    const key = normaliseText(name)
+    let entry = byName.get(key)?.find(e => !e.providers.has(provider))
+    if (!entry) {
+      entry = { id: db.insert(schema.collections).values({ kind: 'playlist', name }).returning().get().id, providers: new Set() }
+      byName.set(key, [...byName.get(key) ?? [], entry])
+    }
+    db.insert(schema.collectionLinks).values({ collectionId: entry.id, provider, providerCollectionId, access, ownerName }).run()
+    entry.providers.add(provider)
+    return entry.id
   }
 
   for (const col of fetched) {
@@ -335,18 +392,24 @@ function pairCollections(fetched: FetchedCollection[]): Map<FetchedCollection, n
       out.set(col, likedId)
       continue
     }
-    const linked = existing.find(e => e.link.provider === col.provider && e.link.providerCollectionId === col.providerCollectionId)
-    if (linked) { out.set(col, linked.collection.id); continue }
+    out.set(col, pair(col.providerCollectionId!, col.name))
+  }
 
-    const key = normaliseText(col.name)
-    let entry = byName.get(key)
-    if (!entry || entry.providers.has(col.provider)) {
-      entry = { id: db.insert(schema.collections).values({ kind: 'playlist', name: col.name }).returning().get().id, providers: new Set() }
-      byName.set(key, entry)
-    }
-    db.insert(schema.collectionLinks).values({ collectionId: entry.id, provider: col.provider, providerCollectionId: col.providerCollectionId }).run()
-    entry.providers.add(col.provider)
-    out.set(col, entry.id)
+  const followed = listed.filter(pl => pl.access === 'followed')
+  for (const pl of followed) {
+    const collectionId = pair(pl.providerCollectionId, pl.name)
+    // It can no longer be read (it stopped being collaborative), so its old snapshot means nothing now.
+    db.delete(schema.snapshots).where(and(eq(schema.snapshots.provider, provider), eq(schema.snapshots.collectionId, collectionId))).run()
+  }
+
+  // Followed playlists the service no longer lists: drop the link, and the collection if nothing else holds it.
+  const listedIds = new Set(listed.map(pl => pl.providerCollectionId))
+  for (const e of existing) {
+    if (e.link.provider !== provider || e.link.access !== 'followed' || listedIds.has(e.link.providerCollectionId!)) continue
+    db.delete(schema.collectionLinks).where(eq(schema.collectionLinks.id, e.link.id)).run()
+    const others = db.select({ id: schema.collectionLinks.id }).from(schema.collectionLinks).where(eq(schema.collectionLinks.collectionId, e.collection.id)).get()
+    const songs = db.select({ id: schema.memberships.id }).from(schema.memberships).where(eq(schema.memberships.collectionId, e.collection.id)).get()
+    if (!others && !songs) db.delete(schema.collections).where(eq(schema.collections.id, e.collection.id)).run()
   }
   return out
 }

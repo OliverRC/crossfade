@@ -46,6 +46,7 @@ Ask before adding dependencies outside this stack.
 Spotify:
 - Saved tracks: read `GET /me/tracks`; write `PUT`/`DELETE /me/library?uris=…` (URIs in the query string, max 40).
 - Playlist items: `/playlists/{id}/items` (old `/tracks` paths return 403). Item objects use `item` (was `track`). Remove body is `{ items: [{ uri }], snapshot_id? }`.
+- Playlist items are readable only for playlists the user owns or collaborates on; others return 403 (`docs/decisions/0006`). `/me/playlists` lists followed ones too, with `owner` and `collaborative`.
 - Create playlist: `POST /me/playlists`. Search `limit` max 10.
 - `external_ids` (ISRC) was removed in Feb 2026 and restored in March 2026.
 - No batch ISRC lookup (Get Several Tracks is gone). Search with `OR` between `isrc:` filters is undocumented; `server/providers/spotify-isrc.ts` detects whether it works and falls back to one ISRC per request.
