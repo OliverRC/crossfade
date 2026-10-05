@@ -312,7 +312,7 @@ Work one milestone at a time and stop at each "Done when" for Oliver to verify. 
 | V0 Login, connections, read adapters, dry-run diff | Done. Its dry-run sync was replaced by pull |
 | Tidal playlist cleanup | Done (`0004`) |
 | **M4 Main and pull** | **In progress**: pull, conflicts, holds, status and the Library page work; awaiting Oliver's check on the real library |
-| **M5 Push** | **In progress**: staging, push to Tidal and push to Spotify built; first real pushes waiting for Oliver; creating playlists next |
+| **M5 Push** | **In progress**: staging, push to Tidal and push to Spotify built and in use (first real pushes 2026-10-04); creating playlists next |
 | M3 Manual search and review | After M5 |
 | Docker and Unraid | Whenever deployment is wanted |
 | M6 Automation | Phase 2 |
